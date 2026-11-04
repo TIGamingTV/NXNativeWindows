@@ -227,7 +227,7 @@ def make_icons(src, app):
 
 _LISTED = {}
 def list_files(src):
-    """[(path, path relative to src with '/', size)] of a folder, by os.scandir (on Windows the sizes come with the listing, no stat per file: TotK's RomFS is 300,000 files).
+    """[(path, path relative to src with '/', size, mtime_ns)] of a folder, by os.scandir (on Windows the sizes and times come with the listing, no stat per file: TotK's RomFS is 300,000 files).
     Listed once per build"""
     src = Path(src)
     if src in _LISTED: return _LISTED[src]
@@ -238,7 +238,7 @@ def list_files(src):
             for e in it:
                 r = rel + e.name
                 if e.is_dir(follow_symlinks=False): stack.append((e.path, r + '/'))
-                else: out.append((e.path, r, e.stat(follow_symlinks=False).st_size))
+                else: st = e.stat(follow_symlinks=False); out.append((e.path, r, st.st_size, st.st_mtime_ns))
     out.sort(key=lambda x: x[1]); _LISTED[src] = out
     return out
 
@@ -248,19 +248,21 @@ def split_data(data, parts, stamp, name, skip_suffix=()):
     (another drive). A folder that a build with the same stamp and the same files filled is kept as it is; otherwise it is made again in <folder>.partial and swapped in,
     so it never mixes files from two builds. Returns (files, bytes)"""
     import concurrent.futures as cf
-    todo = [(f, f'{rel}/{r}', n) for rel, src in parts.items() if not Path(src).is_file() for f, r, n in list_files(src) if not r.endswith(tuple(skip_suffix))]
-    todo += [(str(src), rel, Path(src).stat().st_size) for rel, src in parts.items() if Path(src).is_file()]
-    count, size = len(todo), sum(n for _, _, n in todo)
-    sig = stamp + f'files\t{count}\nbytes\t{size}\n'
+    todo = [(f, f'{rel}/{r}', n, m) for rel, src in parts.items() if not Path(src).is_file() for f, r, n, m in list_files(src) if not r.endswith(tuple(skip_suffix))]
+    todo += [(str(src), rel, (st := Path(src).stat()).st_size, st.st_mtime_ns) for rel, src in parts.items() if Path(src).is_file()]
+    count, size = len(todo), sum(n for _, _, n, _ in todo)
+    # the folder's files are hard links of the sources: a source written again (a new RomFS image, a shader library rebuilt with the same size) is a new file, so its time is in the signature too
+    files = hashlib.sha256(''.join(f'{r}\t{n}\t{m}\n' for _, r, n, m in sorted(todo, key=lambda x: x[1])).encode()).hexdigest()
+    sig = stamp + f'files\t{count}\nbytes\t{size}\ndigest\t{files}\n'
     if (data / 'nxw_data.tsv').is_file() and (data / 'nxw_data.tsv').read_text(encoding='utf-8') == sig:
         t(f'split build: reusing the data folder {data} ({count:,} files, {size / 2**30:.2f} GB, the same build)')
         return count, size
     t(f'split build: game files and shader libraries go to {data} ({count:,} files, hard links on {min(32, (os.cpu_count() or 4) * 2)} threads)')
     tmp = data.with_name(data.name + '.partial')
     if tmp.exists(): shutil.rmtree(tmp)
-    for d in sorted({str(Path(r).parent) for _, r, _ in todo}): (tmp / d).mkdir(parents=True, exist_ok=True)
+    for d in sorted({str(Path(r).parent) for _, r, _, _ in todo}): (tmp / d).mkdir(parents=True, exist_ok=True)
     def one(item):
-        f, r, _ = item; dst = tmp / r
+        f, r, _, _ = item; dst = tmp / r
         try: os.link(f, dst)
         except OSError: shutil.copy2(f, dst)
     with cf.ThreadPoolExecutor(min(32, (os.cpu_count() or 4) * 2)) as ex: list(ex.map(one, todo, chunksize=256))
@@ -422,10 +424,10 @@ def main():
     show_fps = env.get('DM_SHOW_FPS', '0') in ('1', 'YES')
     lang = env.get('DM_LANG') or 'en-US'
 
-    if image and env.get('NXW_MODS_ROMFS'): die('mods\' RomFS folders are laid over a RomFS folder, and this extraction is one RomFS image (RomFS.img)')
-    if env.get('NXW_MODS_ROMFS'):   # mods' RomFS folders (win/mods.py): hard links of the game's files with the mods' laid over them
+    if env.get('NXW_MODS_ROMFS'):   # mods' RomFS folders (win/mods.py): over a RomFS image (the NSP script's extraction), a new image with them in it; over a folder, hard links
         import mods
-        romfs = p0.romfs = mods.overlay_romfs(romfs, env['NXW_MODS_ROMFS'].split(os.pathsep), w / 'build/romfs_mods', log=t)
+        if image: romfs = p0.romfs = rfs.Path(mods.overlay_image(Path(str(romfs)), env['NXW_MODS_ROMFS'].split(os.pathsep), w / 'build/romfs_mods.img', log=t))
+        else: romfs = p0.romfs = mods.overlay_romfs(romfs, env['NXW_MODS_ROMFS'].split(os.pathsep), w / 'build/romfs_mods', log=t)
     v = chain_version()
     if capture: t('capture IPA: no shader libraries; the game saves the shaders it compiles at run time into Documents')
 
@@ -520,7 +522,7 @@ def main():
         sp = env.get('NXW_SPLIT_DATA', '')
         if sp and sp != '0':   # a split build: the app's "game data needed" screen (win/ios/DataHelp.m) names the data folder and its size
             dname = Path(sp).name if sp not in ('1', 'YES') else out_ipa.stem + '-data'
-            dsize = sum(n for d in (None if image else romfs, msl_ios / msldir, aoc if aoc and aoc.is_dir() else None) if d for _, _, n in list_files(d))   # listed once, reused by split_data
+            dsize = sum(n for d in (None if image else romfs, msl_ios / msldir, aoc if aoc and aoc.is_dir() else None) if d for _, _, n, _ in list_files(d))   # listed once, reused by split_data
             if image: dsize += Path(str(romfs)).stat().st_size
             pl['NXWDataFolder'] = dname; pl['NXWDataSize'] = f'{dsize / 2**30:.1f} GB' if dsize >= 2**30 else f'{dsize / 2**20:.0f} MB'
         plistlib.dump(pl, f, fmt=plistlib.FMT_BINARY)

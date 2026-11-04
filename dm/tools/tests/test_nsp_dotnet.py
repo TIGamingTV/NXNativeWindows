@@ -67,4 +67,22 @@ class Dotnet(unittest.TestCase):
                 self.assertNotIn('DOTNET_ROOT', os.environ)
 
 
+class NxExtractBuild(unittest.TestCase):
+    def test_one_build_per_source_key(self):   # the title probe's build serves the build folder, and a later run's build folder keeps its build until the sources or the SDK change
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            d, builds, sdk = Path(d), [], ['10.0.403']
+            def build(t): builds.append(t); (t / 'nx_extract').write_text('exe'); (t / 'LibHac.dll').write_text('lib')
+            def fingerprint(*items, env=None): return repr([i for i in items if i[0] == 'files']) + sdk[0]
+            with mock.patch.object(nsp, 'fingerprint', fingerprint), mock.patch.dict(nsp._NX_BUILT, clear=True):
+                probe = d / 'probe/tools/nx_extract/nx_extract'; work = d / 'work/tools/nx_extract/nx_extract'
+                self.assertEqual(nsp.nx_extract_cached(REPO, probe, {}, build), probe)
+                nsp.rmtree(d / 'probe')
+                self.assertEqual(nsp.nx_extract_cached(REPO, work, {}, build), work)
+                self.assertEqual(len(builds), 1); self.assertEqual((work.parent / 'LibHac.dll').read_text(), 'lib')
+                nsp._NX_BUILT.clear()   # a new run
+                nsp.nx_extract_cached(REPO, work, {}, build); self.assertEqual(len(builds), 1)
+                sdk[0] = '10.0.500'; nsp.nx_extract_cached(REPO, work, {}, build); self.assertEqual(len(builds), 2)
+
+
 if __name__ == '__main__': unittest.main()

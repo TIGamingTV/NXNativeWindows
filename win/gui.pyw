@@ -91,7 +91,12 @@ def stage_folder(files):
     copied = []
     for f in files:
         t = dst / f.name
-        if t.exists() and t.stat().st_size == f.stat().st_size: continue
+        if t.exists():   # the same file (a hard link), or a copy of this one (copy2 keeps the time); a file of the same size from an earlier pick is replaced
+            try:
+                if os.path.samefile(t, f): continue
+                ts, fs = t.stat(), f.stat()
+                if (ts.st_size, ts.st_mtime_ns) == (fs.st_size, fs.st_mtime_ns): continue
+            except OSError: pass
         if t.exists(): t.unlink()
         try: os.link(f, t)
         except OSError: shutil.copy2(f, t); copied.append(f.name)

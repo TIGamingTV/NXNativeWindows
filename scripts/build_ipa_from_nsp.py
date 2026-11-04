@@ -33,7 +33,7 @@
 # unless ALLOW_OTHER_METAL / --allow-other-metal. Issue #242 reported corruption with another compiler; the cause is still unconfirmed.
 # Python 3.12+ is required for bounded archive mappings inside images. The Python running this file needs lz4, capstone 5.x and fonttools (and backports.zstd before Python 3.14); also needed: Xcode, xcodegen, .NET SDK 10, zstd. SPIRV-Cross is the in-repo build. A first run takes 2 (Metroid Dread) to 10 minutes (Breath of the Wild: 5 of them the shader split), longer when shader libraries must be compiled; a repeat run with unchanged inputs takes about 20 s (Metroid Dread), mostly packing the IPA. Key values are never printed.
 # The console shows one line per stage ([k/n] stage, with a bar, done/total, percent, elapsed time and ETA where the work can be counted); the tools' own output goes only to logs/ (PROGRESS / --progress). --progress json writes newline-delimited JSON events to stdout.
-import ast, collections, contextlib, ctypes, errno, getpass, hashlib, importlib.util, json, os, re, shlex, shutil, struct, subprocess, sys, tempfile, threading, time, types
+import ast, atexit, collections, contextlib, ctypes, errno, getpass, hashlib, importlib.util, json, os, re, shlex, shutil, struct, subprocess, sys, tempfile, threading, time, types
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dm/tools"))
 import romfs as rfs
@@ -392,15 +392,36 @@ def rmtree(p):
     elif p.exists(): shutil.rmtree(p, onexc=_gone)   # Python 3.13 and later pass these by themselves
 
 
-def build_nx_extract(repo, work, logs, env):
-    """Build nx_extract into <work>/tools/nx_extract/. It is built in a temporary folder and copied over: with an apostrophe in the output path (e.g. "Bowser's Fury") MSBuild's conditions break,
-    LibHac.dll and the executable are not copied, and the build still reports success"""
-    nx = work / 'tools/nx_extract/nx_extract'
-    with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:
-        run(['dotnet', 'build', repo / 'dm/tools/nx_extract', '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
-        if not (Path(t) / 'nx_extract').exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
-        rmtree(nx.parent); shutil.copytree(t, nx.parent)
+_NX_BUILT = {}   # this run's nx_extract builds by nx_extract_key: a private copy, so the build for the title probe (in a folder deleted after it) serves the build folder too
+
+
+def nx_extract_key(repo, env):   # what an nx_extract build is made from: its sources and the .NET SDK (the LibHac version is in the project file)
+    src = repo / 'dm/tools/nx_extract'
+    return fingerprint(('files', sorted(src.glob('*.cs')) + sorted(src.glob('*.csproj'))), ('cmd', ['dotnet', '--version']), env=env)
+
+
+def nx_extract_cached(repo, nx, env, build):
+    """nx (<folder>/nx_extract) as build(temporary folder) makes it, reused while nx_extract_key is unchanged: the folder's key file, else this run's earlier build, else a new build
+    (dotnet build takes seconds even with nothing to compile)"""
+    key, stamp = nx_extract_key(repo, env), nx.parent / 'nx_extract.key'
+    if reused(stamp, key) is not None and (nx.exists() or nx.with_suffix('.exe').exists()): return nx
+    if key not in _NX_BUILT or not _NX_BUILT[key].is_dir():
+        with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:
+            build(Path(t))
+            keep = Path(tempfile.mkdtemp(prefix='nx_extract_built_')); atexit.register(shutil.rmtree, keep, ignore_errors=True)   # removed when this process ends
+            rmtree(keep); shutil.copytree(t, keep); _NX_BUILT[key] = keep
+    rmtree(nx.parent); shutil.copytree(_NX_BUILT[key], nx.parent)
+    (nx.parent / 'nx_extract.key').write_text(key + '\n')
     return nx
+
+
+def build_nx_extract(repo, work, logs, env):
+    """Build nx_extract into <work>/tools/nx_extract/ (reused while its sources and the .NET SDK are unchanged, nx_extract_cached). It is built in a temporary folder and copied over: with an apostrophe
+    in the output path (e.g. "Bowser's Fury") MSBuild's conditions break, LibHac.dll and the executable are not copied, and the build still reports success"""
+    def build(t):
+        run(['dotnet', 'build', repo / 'dm/tools/nx_extract', '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
+        if not (t / 'nx_extract').exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
+    return nx_extract_cached(repo, work / 'tools/nx_extract/nx_extract', env, build)
 
 
 def swap_in(tmp, dst):   # swap the new output in as a whole (the old one is untouched on failure)
@@ -2184,7 +2205,8 @@ class ShaderWatch:
 
     def __call__(self):
         if not self.w:   # dmsh_build.py's temporary folder: the dmsh_* under WORK made since it started
-            self.w = max((d for d in self.tmp.glob('dmsh_*') if d.stat().st_birthtime >= self.t0 - 2), key=lambda d: d.stat().st_birthtime, default=None)
+            born = lambda d: (st := d.stat()) and getattr(st, 'st_birthtime', st.st_mtime)   # Linux has no birth time: the folder's mtime is no earlier than its creation
+            self.w = max((d for d in self.tmp.glob('dmsh_*') if born(d) >= self.t0 - 2), key=born, default=None)
         try: ext = collections.Counter(os.path.splitext(x)[1] for x in os.listdir(self.w)) if self.w else collections.Counter()
         except OSError: ext = collections.Counter()
         if self.t1 is None:
@@ -3067,7 +3089,12 @@ def main(args=None):
         rmtree(work / 'tmp'); return {'row': (PROGRAM_INDEX, g.id, patched, rfs.source(game), ios, gfx), 'ex': ex, 'keep': keep}
     programs = other_programs(args, g)
     if programs and romfs_mode == 'separate': raise BuildError('a game of several programs keeps its files in the app (ROMFS / --romfs bundle): Documents holds one RomFS image, one program\'s')
-    if not prepare_xcode and free_gb(out_ipa.parent) < 5: raise BuildError(f'less than 5 GB free on the volume of {out_ipa.parent}')
+    if not prepare_xcode:   # the new IPA is written beside the old one, then renamed: about the last IPA's size, else the game files' (bundled ones), plus 5 GB
+        split = romfs_mode == 'separate' or os.environ.get('NXW_SPLIT_DATA', '0') not in ('', '0')   # the Windows driver's split build (win/build_ipa_windows.py --split-data) hard-links the game files
+        image = Path(str(rfs.source(game)))   # RomFS.img as a file (rfs.Path shows an image as a folder), else the RomFS folder
+        est = 0 if split else out_ipa.stat().st_size if out_ipa.is_file() else image.stat().st_size if image.is_file() else tree_size(image)[1]
+        need = est / 2**30 + 5
+        if free_gb(out_ipa.parent) < need: raise BuildError(f'less than {need:.0f} GB free on the volume of {out_ipa.parent}: the IPA needs about {est / 2**30:.1f} GB, packed beside the last one')
     say('preparing the Xcode project' if prepare_xcode else f'building the IPA → {out_ipa}')
     ipa_env = dict(env, GAME=g.id, W=str(work / 'ipa'), PATCHED=str(patched), ROMFS=str(rfs.source(game)), MSL_IOS=str(ios), GFXAPI=gfx, FONT_PY=py, DM_DISPLAY_NAME=app_name, DM_BUNDLE_ID=bundle_id, AOC=str(aoc or ''), DM_XCODE_DERIVED_DATA=str(work / 'xcode-derived-data'), DM_TEAM_ID=team_id, DM_LANG=lang)
     if prepare_xcode: ipa_env['DM_XCODE_PROJECT_DIR'] = str(project.parent)

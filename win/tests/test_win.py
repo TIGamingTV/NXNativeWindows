@@ -230,5 +230,36 @@ class PackIpa(unittest.TestCase):
             self.assertEqual(modes['Payload/DmIOS.app/Info.plist'] & 0o777, 0o644 if os.name == 'nt' else modes['Payload/DmIOS.app/Info.plist'] & 0o777)
 
 
+class ModsImage(unittest.TestCase):
+    """win/mods.py overlay_image: RomFS mods over the RomFS image every NSP build extracts (build_app.py refused them before)"""
+    def test_overlay_replaces_adds_and_keeps_flags(self):
+        import mods, romfs_image as ri, romfs as rfs
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d); game, mod = d / 'game', d / 'mods/m/romfs'
+            (game / 'Pack').mkdir(parents=True); (game / 'Pack/A.pack').write_bytes(b'old' * 100); (game / 'Pack/b.bin').write_bytes(b'keep'); (game / 'top.txt').write_bytes(b'top')
+            img = d / 'RomFS.img'; ri.pack(game, img)
+            raw = bytearray(img.read_bytes()); _, ioff, _, n = ri.HEAD.unpack_from(raw)   # mark Pack/b.bin damaged, as nx_extract --allow-damaged writes it
+            for k in range(n):
+                a, b, no, nl, t, fl = ri.ENT.unpack_from(raw, ioff + k * ri.ENT.size)
+                if t == 1 and b == 4: ri.ENT.pack_into(raw, ioff + k * ri.ENT.size, a, b, no, nl, t, 1)
+            img.write_bytes(raw)
+            (mod / 'pack').mkdir(parents=True); (mod / 'pack/a.PACK').write_bytes(b'new!')   # the game's name is kept, matched without regard to case
+            (mod / 'New/Deep').mkdir(parents=True); (mod / 'New/Deep/c.txt').write_bytes(b'added')
+            logs = []; out = mods.overlay_image(img, [d / 'mods/m/romfs'], d / 'out/romfs_mods.img', log=logs.append)
+            idx = ri.read_index(out)
+            self.assertEqual(sorted(k for k, v in idx.items() if not v[0]), ['New/Deep/c.txt', 'Pack/A.pack', 'Pack/b.bin', 'top.txt'])
+            r = rfs.Path(out)
+            self.assertEqual((r / 'Pack/A.pack').read_bytes(), b'new!'); self.assertEqual((r / 'Pack/b.bin').read_bytes(), b'keep')
+            self.assertEqual((r / 'New/Deep/c.txt').read_bytes(), b'added'); self.assertEqual((r / 'top.txt').read_bytes(), b'top')
+            raw = out.read_bytes(); _, ioff, _, n = ri.HEAD.unpack_from(raw)
+            flags = {raw[ioff + n * ri.ENT.size + no:ioff + n * ri.ENT.size + no + nl]: fl for a, b, no, nl, t, fl in (ri.ENT.unpack_from(raw, ioff + k * ri.ENT.size) for k in range(n))}
+            self.assertEqual((flags[b'b.bin'], flags[b'A.pack']), (1, 0))
+            self.assertIn('1 file(s) replaced and 1 added', logs[-1])
+            mtime = out.stat().st_mtime_ns; mods.overlay_image(img, [d / 'mods/m/romfs'], d / 'out/romfs_mods.img', log=logs.append)
+            self.assertIn('reusing', logs[-1]); self.assertEqual(out.stat().st_mtime_ns, mtime)
+            (mod / 'top.txt').write_bytes(b'changed'); mods.overlay_image(img, [d / 'mods/m/romfs'], d / 'out/romfs_mods.img', log=logs.append)
+            self.assertEqual((rfs.Path(out) / 'top.txt').read_bytes(), b'changed')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

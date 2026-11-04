@@ -9,11 +9,14 @@
 #   --skip: an archive path left out of the walk of the folder that holds it (folders a stale app build still has, the signature); a mapping of its own still adds it
 #   --skip-suffix: files whose names end so are left out of every walk (build_ipa.sh: the pulling vertex libraries _bp.metallib when the profile's pso_mtl4 is off, unless IOS_PULL overrides it)
 #   Writes <out.ipa>.partial and renames it at the end; prints "pack: N entries, X bytes" first (the NSP script's progress total, X = the files' bytes) and a summary line last
+#   Big files are deflated by the pool too, in PART pieces (pigz's way): each piece is primed with the 32 KB before it (zdict) and ends on a byte boundary with a sync flush, the last one with the
+#   final block, so the pieces join into one ordinary deflate stream with about the ratio of one compressor (a 17 GB RomFS image no longer takes one core for the whole pack)
 #   Repeat packs reuse a file when its size, mtime_ns, ctime_ns and inode are unchanged (true on APFS). A tool that rewrites in place and restores mtime defeats this if ctime also stays
-#   unchanged; --no-reuse forces a full pack. The index holds only source metadata and compression settings; ZIP metadata comes from the old IPA.
-#   Only mappings whose source folder is on APFS reuse files; other mappings pack their files again. The kept run needs an APFS clone of the old IPA; if cloning fails, eligible files are copied compressed.
+#   unchanged (on Windows ctime is the creation time and scandir gives no file ID, so there only size and mtime count); --no-reuse forces a full pack. The index holds only source metadata and compression settings; ZIP metadata comes from the old IPA.
+#   Only mappings whose source folder is on a file system with stable file times and IDs (REUSE_FS: APFS, NTFS, ReFS, ext4, XFS, Btrfs) reuse files; others (exFAT, FAT, network shares) pack their files again.
+#   The kept run needs an APFS clone of the old IPA; without one (any other file system), eligible files are copied compressed.
 #   Reused bytes are not checked against their CRC: damage inside the old IPA carries over. Use --no-reuse or delete <out.ipa>.idx to rebuild
-import argparse, collections, concurrent.futures as cf, ctypes, json, os, stat, struct, sys, time, zipfile, zlib
+import argparse, collections, concurrent.futures as cf, ctypes, json, os, re, stat, struct, sys, time, zipfile, zlib
 
 LEVEL = 6
 IDX_VERSION = 3
@@ -21,6 +24,9 @@ BIG = 256 << 20      # files above this are streamed by the writer; smaller ones
 WINDOW = 2 << 30     # input bytes in the pool at once
 QUEUE = 4096         # entries in the pool at once (folders of tiny files)
 CHUNK = 16 << 20
+PART = 4 << 20       # a big file's deflate pieces (pigz uses 128 KB; bigger pieces cost the pool less and keep the stream as small)
+DICT = 32 << 10      # deflate's window: the bytes before a piece that prime its compressor
+REUSE_FS = {b'apfs', b'ntfs', b'refs', b'ext2', b'ext3', b'ext4', b'xfs', b'btrfs'}   # file systems whose mtimes (and file IDs) change with their content
 EXEC = set()   # --exec: archive paths that get mode 755 when packing on Windows (the app's executable)
 L32, L16 = 0xFFFFFFFF, 0xFFFF
 DIR_MODE = stat.S_IFDIR | 0o755   # a parent folder no source folder stands for (Payload/, msl/); its time is 1980-01-01, so it is the same in every pack
@@ -65,6 +71,16 @@ def load(path, deflate):   # in the pool: (method, CRC, the bytes to write, unco
     return 0, crc, data, usize
 
 
+def deflate_part(data, zdict, last):   # in the pool: one piece of a big file's deflate stream (see PART)
+    c = zlib.compressobj(LEVEL, zlib.DEFLATED, -15, zdict=zdict) if zdict else zlib.compressobj(LEVEL, zlib.DEFLATED, -15)
+    return c.compress(data) + c.flush(zlib.Z_FINISH if last else zlib.Z_SYNC_FLUSH)
+
+
+def pread(fd, n, at):   # os.pread, or a seek and a read where there is none (Windows); this process reads the old IPA from one thread
+    if hasattr(os, 'pread'): return os.pread(fd, n, at)
+    os.lseek(fd, at, os.SEEK_SET); return os.read(fd, n)
+
+
 def dos_time(t):
     y, mo, d, h, mi, s = time.localtime(t)[:6]
     if y < 1980: y, mo, d, h, mi, s = 1980, 1, 1, 0, 0, 0
@@ -80,8 +96,9 @@ def header(e, method, crc, csize, usize, z64=False):   # a local header: (its by
 
 
 def clone(old, dst):   # clone the checked inode, even if its path was replaced; AT_FDCWD is -2 on Darwin
+    if sys.platform != 'darwin': return False
     try: return ctypes.CDLL(None, use_errno=True).fclonefileat(old.fileno(), -2, os.fsencode(dst), 0) == 0
-    except (AttributeError, OSError): return False
+    except (AttributeError, OSError, TypeError): return False
 
 
 class Statfs64(ctypes.Structure):   # Darwin's statfs64 layout from sys/mount.h, including the fields after f_fstypename
@@ -90,12 +107,25 @@ class Statfs64(ctypes.Structure):   # Darwin's statfs64 layout from sys/mount.h,
                 ('f_fstypename', ctypes.c_char * 16), ('f_mntonname', ctypes.c_char * 1024), ('f_mntfromname', ctypes.c_char * 1024), ('reserved', ctypes.c_uint32 * 8)]
 
 
-def fs_type(root):
-    if sys.platform != 'darwin': return b''
-    fs = Statfs64()
+def fs_type(root):   # the file system's name in lower case (b'apfs', b'ntfs', b'ext4', ...), b'' when it cannot be read
     try:
-        if ctypes.CDLL(None).statfs64(os.fsencode(root), ctypes.byref(fs)) == 0: return fs.f_fstypename
-    except (AttributeError, OSError): pass
+        if not os.path.exists(root): return b''
+        if sys.platform == 'darwin':
+            fs = Statfs64()
+            if ctypes.CDLL(None).statfs64(os.fsencode(root), ctypes.byref(fs)) == 0: return fs.f_fstypename.lower()
+        elif os.name == 'nt':
+            k32, vol, name = ctypes.windll.kernel32, ctypes.create_unicode_buffer(1024), ctypes.create_unicode_buffer(64)
+            if k32.GetVolumePathNameW(os.path.abspath(root), vol, 1024) and k32.GetVolumeInformationW(vol, None, 0, None, None, None, name, 64):
+                return name.value.lower().encode()
+        elif sys.platform.startswith('linux'):   # the mount that holds root: the longest mount point it lies under (/proc/self/mountinfo: field 5, the type after ' - ')
+            path, best = os.path.realpath(root), (-1, b'')
+            with open('/proc/self/mountinfo', 'rb') as f:
+                for line in f:
+                    left, _, right = line.partition(b' - ')
+                    mp = re.sub(rb'\\([0-7]{3})', lambda m: bytes([int(m[1], 8)]), left.split()[4]).decode('utf-8', 'surrogateescape')
+                    if (path == mp or path.startswith(mp.rstrip('/') + '/')) and len(mp) > best[0]: best = (len(mp), right.split()[0].lower())
+            return best[1]
+    except (AttributeError, OSError, IndexError, ValueError): pass
     return b''   # unknown identity: do not reuse
 
 
@@ -103,6 +133,7 @@ class Zip:
     def __init__(self, path, keep=0):   # keep: the bytes of a clone at path that stay (the leading entries kept)
         self.f = open(path, 'r+b' if keep else 'wb', buffering=1 << 20)
         if keep: self.f.seek(keep)
+        self.pool: cf.Executor | None = None   # deflates a big file's pieces (stream)
         self.pos, self.cd, self.written = keep, [], 0   # written: the bytes this pack writes (entries, header patches, the central directory; main adds the index)
         self.stats = collections.Counter()
 
@@ -147,11 +178,20 @@ class Zip:
         h = self.local(e, 8 if deflate else 0, 0, 0 if deflate else usize, usize, z64)
         crc, csize, read, c = 0, 0, 0, zlib.compressobj(LEVEL, zlib.DEFLATED, -15) if deflate else None
         with open(e.path, 'rb') as f:
-            while b := f.read(CHUNK):
-                read += len(b); crc = zlib.crc32(b, crc)
-                if c: b = c.compress(b)
-                self.w(b); csize += len(b)
-            if c: b = c.flush(); self.w(b); csize += len(b)
+            if c and self.pool and usize > PART:   # the pool deflates PART pieces, this thread reads, sums the CRC and writes them in order
+                pend, tail, depth = collections.deque(), None, 2 * (os.cpu_count() or 4)
+                while read < usize and (b := f.read(min(PART, usize - read))):
+                    read += len(b); crc = zlib.crc32(b, crc)
+                    pend.append(self.pool.submit(deflate_part, b, tail, read == usize)); tail = b[-DICT:]
+                    while len(pend) >= depth: b = pend.popleft().result(); self.w(b); csize += len(b)
+                while pend: b = pend.popleft().result(); self.w(b); csize += len(b)
+                read += len(f.read(1))   # a file that grew is reported below (its stream ended at the size it had)
+            else:
+                while b := f.read(CHUNK):
+                    read += len(b); crc = zlib.crc32(b, crc)
+                    if c: b = c.compress(b)
+                    self.w(b); csize += len(b)
+                if c: b = c.flush(); self.w(b); csize += len(b)
         if read != usize: sys.exit(f'[RED] pack_ipa: {e.path} changed size while it was packed')
         if c and csize >= usize:   # not smaller: stored instead
             self.f.seek(h[0]); self.f.truncate(); self.pos = h[0]; return self.stream(e, False)
@@ -166,7 +206,7 @@ class Zip:
         left, at = csize, info.header_offset + 30 + nl + el
         h = self.local(e, method, crc, csize, usize, usize >= L32 or csize >= L32)
         while left:
-            b = os.pread(old.fileno(), min(CHUNK, left), at)
+            b = pread(old.fileno(), min(CHUNK, left), at)
             if not b: sys.exit(f'[RED] pack_ipa: the old IPA ended while {e.name} was copied from it')
             self.w(b); left -= len(b); at += len(b)
         self.central(e, h, method, crc, csize, usize)
@@ -214,7 +254,7 @@ def match(e, row, info, old, idx, apfs):   # one header comparison for both the 
         if (info.compress_type, info.CRC, info.compress_size, info.file_size) != (method, crc, csize, usize): return None
     h = header(e, method, crc, csize, usize, usize >= L32 or csize >= L32)
     if info.header_offset < 0 or info.header_offset + len(h[0]) + csize > idx['ipa'][0]: return None
-    if os.pread(old.fileno(), len(h[0]) + len(data), info.header_offset) != h[0] + data: return None
+    if pread(old.fileno(), len(h[0]) + len(data), info.header_offset) != h[0] + data: return None
     return h
 
 
@@ -250,8 +290,9 @@ def main():
     es = entries(maps, {s.strip('/') for s in a.skip}, tuple(a.skip_suffix))
     total = sum(e.st.st_size for e in es if e.st and stat.S_ISREG(e.st.st_mode))
     print(f'pack: {len(es)} entries, {total} bytes', flush=True)
-    apfs = {root: fs_type(root) == b'apfs' for root in {src for _, src in maps}}
-    disabled = '; '.join(f'reuse off for {arc}: not APFS' for arc, src in maps if not apfs[src])
+    fss = {root: fs_type(root) for root in {src for _, src in maps}}
+    apfs = {root: fs in REUSE_FS for root, fs in fss.items()}   # the roots whose files may be reused (the name is the index's: APFS was the first such file system)
+    disabled = '; '.join(f'reuse off for {arc}: {fss[src].decode(errors="replace") or "unknown"} file system' for arc, src in maps if not apfs[src])
     flags = [not e.name.lower().endswith(store) if store else True for e in es]   # each file's deflate flag
     files = {e.name: fingerprint(e, f) for e, f in zip(es, flags) if e.st and stat.S_ISREG(e.st.st_mode)}
     part, tmp, ipart = a.out + '.partial', a.out + '.clone', a.out + '.idx.partial'
@@ -279,6 +320,7 @@ def main():
             if usize != e.st.st_size: sys.exit(f'[RED] pack_ipa: {e.path} changed size while it was packed')
             z.put(e, method, crc, data, usize); return usize
         with cf.ThreadPoolExecutor(os.cpu_count()) as pool:
+            z.pool = pool
             for e, deflate in zip(es[len(keep):], flags[len(keep):]):
                 if not (e.st and stat.S_ISREG(e.st.st_mode)): pend.append(('other', e, None)); continue
                 info = infos.get(e.name)
@@ -291,6 +333,7 @@ def main():
                 pend.append(('load', e, pool.submit(load, e.path, deflate))); inflight += e.st.st_size
             while pend: inflight -= one()
         z.close()
+        if old: old.close(); old = None   # Windows replaces no file that is open
         st = os.stat(part)   # bind the index to this file before publishing; rename preserves its mtime
         os.replace(part, a.out)
     except BaseException:

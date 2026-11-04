@@ -54,8 +54,9 @@ if (os.name == 'nt' or os.environ.get('NXW_LINUX')) and not os.environ.get('NXW_
             os.pread = _pread
 
     # os.replace as on a Mac: Windows refuses to replace a file another thread has open, which POSIX rename allows. The shader build's content-addressed caches
-    # (dmsh_mtlcache.py) have threads finish the same entry at once; a replace that keeps failing onto an existing file of the same size is that race, and the copy goes
-    import time as _time
+    # (dmsh_mtlcache.py) have threads finish the same entry at once; a replace that keeps failing onto an existing file with the same bytes is that race, and the copy goes.
+    # Only then: a file of the same size but other bytes (an IPA another program holds open) raises, so no new output is dropped in silence
+    import time as _time, filecmp as _filecmp
     _replace = os.replace
     def _win_replace(src, dst, *a, **k):
         for i in range(20):
@@ -63,7 +64,8 @@ if (os.name == 'nt' or os.environ.get('NXW_LINUX')) and not os.environ.get('NXW_
             except PermissionError:
                 if i == 19:
                     try:
-                        if os.path.isfile(dst) and os.path.getsize(dst) == os.path.getsize(src): os.remove(src); return None
+                        if (os.path.isfile(dst) and os.path.getsize(dst) == os.path.getsize(src) <= 256 << 20
+                                and _filecmp.cmp(src, dst, shallow=False)): os.remove(src); return None
                     except OSError: pass
                     raise
                 _time.sleep(0.05 * (i + 1))

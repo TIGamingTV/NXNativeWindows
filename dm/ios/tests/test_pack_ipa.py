@@ -21,6 +21,9 @@ spec = importlib.util.spec_from_file_location('build_ipa_from_nsp', REPO / 'scri
 nsp = importlib.util.module_from_spec(spec); spec.loader.exec_module(nsp)
 
 
+CLONES = sys.platform == 'darwin'   # pack.clone: APFS's fclonefileat
+
+
 class PackIpa(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory(); self.addCleanup(self.tmpdir.cleanup)
@@ -81,6 +84,13 @@ class PackIpa(unittest.TestCase):
                 self.assertEqual(a.read(ia), b.read(ib), ia.filename)
         self.assertEqual(self.out.read_bytes(), fresh.read_bytes())
 
+    def assertKept(self, n):   # the leading bytes a repeat pack kept through a clone of the old IPA: only APFS clones; elsewhere every reused file is copied compressed
+        self.assertEqual(self.kept, n if CLONES else 0)
+
+    def assertKeptAbove(self, n):
+        if CLONES: self.assertGreater(self.kept, n)
+        else: self.assertEqual(self.kept, 0)
+
     def offset(self, name):
         with zipfile.ZipFile(self.out) as z: return z.getinfo('Payload/DmIOS.app/' + name).header_offset
 
@@ -89,7 +99,7 @@ class PackIpa(unittest.TestCase):
         with zipfile.ZipFile(self.out) as z: end = z.start_dir
         with patch.object(pack, 'load', side_effect=AssertionError('unchanged file compressed')):
             self.run_pack()
-        self.assertEqual(self.reused, 6); self.assertEqual(self.kept, end)
+        self.assertEqual(self.reused, 6); self.assertKept(end)
         self.same_as_fresh()
 
     def test_app_change_keeps_romfs_and_ignores_app_folder_time(self):
@@ -98,13 +108,13 @@ class PackIpa(unittest.TestCase):
         os.replace(self.app / 'replacement', self.app / 'exe'); os.chmod(self.app / 'exe', 0o755)
         os.utime(self.app, (time.time() - 7200,) * 2)
         self.run_pack()
-        self.assertEqual(self.reused, 5); self.assertEqual(self.kept, self.offset('exe'))
-        self.assertGreater(self.kept, self.offset('romfs/text.txt')); self.same_as_fresh()
+        self.assertEqual(self.reused, 5); self.assertKept(self.offset('exe'))
+        self.assertKeptAbove(self.offset('romfs/text.txt')); self.same_as_fresh()
 
     def test_change_in_first_mapping(self):
         self.run_pack(); (self.rom / 'déjà/empty').write_bytes(b'changed')
         self.run_pack(); self.assertEqual(self.reused, 5)
-        self.assertEqual(self.kept, self.offset('romfs/déjà/empty')); self.same_as_fresh()
+        self.assertKept(self.offset('romfs/déjà/empty')); self.same_as_fresh()
 
     def test_changed_added_removed_and_same_size_rewrite(self):
         self.run_pack()
@@ -152,11 +162,11 @@ class PackIpa(unittest.TestCase):
         (self.app / 'sub/link').unlink(); os.symlink('../exe', self.app / 'sub/link')
         # Isolate the symlink header change even when relinking crosses a ZIP timestamp tick.
         os.utime(self.app / 'sub', ns=(parent.st_atime_ns, parent.st_mtime_ns))
-        self.run_pack(); self.assertEqual(self.kept, self.offset('sub/link')); self.same_as_fresh()
+        self.run_pack(); self.assertKept(self.offset('sub/link')); self.same_as_fresh()
         os.utime(self.app / 'sub', (time.time() - 7200,) * 2)
-        self.run_pack(); self.assertEqual(self.kept, self.offset('sub/')); self.same_as_fresh()
+        self.run_pack(); self.assertKept(self.offset('sub/')); self.same_as_fresh()
         os.chmod(self.app / 'sub', 0o700)
-        self.run_pack(); self.assertGreater(self.kept, self.offset('sub/link')); self.same_as_fresh()
+        self.run_pack(); self.assertKeptAbove(self.offset('sub/link')); self.same_as_fresh()
 
     def test_store_flag_change(self):
         self.run_pack(); self.run_pack(None, '--store', '.TXT'); self.assertEqual(self.reused, 5)
@@ -185,6 +195,26 @@ class PackIpa(unittest.TestCase):
         self.run_pack(big=1024); self.assertEqual(self.reused, 5); self.same_as_fresh(big=1024)
         self.run_pack(); self.assertEqual(self.reused, 6); self.same_as_fresh()
 
+    def test_streamed_pieces_join_into_one_stream(self):   # a big file deflated by the pool in PART pieces: one valid entry, about the size of one compressor's, stored when not smaller
+        (self.rom / 'text.txt').write_bytes(b''.join(b'line %d of a compressible file\n' % i for i in range(20000)))
+        (self.rom / 'random.bin').write_bytes(os.urandom(70000))
+        one = self.tmp / 'one.ipa'
+        with patch.object(pack, 'PART', 1 << 40): self.run_pack(one, '--no-reuse', big=1024)
+        for part in (4096, 5000, 65536):
+            with self.subTest(part=part), patch.object(pack, 'PART', part):
+                self.run_pack(None, '--no-reuse', big=1024)
+                with zipfile.ZipFile(self.out) as a, zipfile.ZipFile(one) as b:
+                    self.assertIsNone(a.testzip())
+                    for name in ('text.txt', 'random.bin'):
+                        ia, ib = a.getinfo('Payload/DmIOS.app/romfs/' + name), b.getinfo('Payload/DmIOS.app/romfs/' + name)
+                        self.assertEqual(a.read(ia), (self.rom / name).read_bytes())
+                        self.assertEqual((ia.CRC, ia.compress_type), (ib.CRC, ib.compress_type))
+                        self.assertLessEqual(ia.compress_size, ib.compress_size * 1.02 + 64, name)
+                    self.assertEqual(a.getinfo('Payload/DmIOS.app/romfs/random.bin').compress_type, zipfile.ZIP_STORED)
+                    self.assertEqual(a.getinfo('Payload/DmIOS.app/romfs/text.txt').compress_type, zipfile.ZIP_DEFLATED)
+        with patch.object(pack, 'PART', 4096):   # a repeat pack copies the pieced entries as it copies any other
+            self.run_pack(None, '--no-reuse', big=1024); self.run_pack(big=1024); self.assertEqual(self.reused, 6); self.same_as_fresh(big=1024)
+
     def test_stream_drains_pool_before_later_jobs(self):
         load, stream, events, submitted = pack.load, pack.Zip.stream, [], []
         class Pool(pack.cf.ThreadPoolExecutor):
@@ -210,7 +240,7 @@ class PackIpa(unittest.TestCase):
         def zip64(e, method, crc, csize, usize, z64=False): return header(e, method, crc, csize, usize, True)
         with patch.object(pack, 'header', zip64):
             self.run_pack(); self.run_pack(); self.assertEqual(self.reused, 6)
-            self.assertGreater(self.kept, self.offset('sub/link')); self.same_as_fresh()
+            self.assertKeptAbove(self.offset('sub/link')); self.same_as_fresh()
         self.run_pack(); self.assertEqual(self.reused, 0); self.assertEqual(self.kept, 0); self.same_as_fresh()
 
     def test_clone_uses_checked_inode_after_path_replaced(self):
@@ -222,7 +252,7 @@ class PackIpa(unittest.TestCase):
             os.replace(replacement, self.out)
             return clone(old, dst)
         with patch.object(pack, 'clone', checked_clone): self.run_pack()
-        self.assertGreater(self.kept, 0); self.same_as_fresh()
+        self.assertKeptAbove(0); self.same_as_fresh()
 
     def test_stat_before_publish_and_stale_partial_cleanup(self):
         self.run_pack()
@@ -275,7 +305,7 @@ class PackIpa(unittest.TestCase):
                         if e.path == str(source):
                             data = source.read_bytes(); source.write_bytes(data + b'grow' if grow else data[:-4])
                         return stream(z, e, deflate)
-                    with patch.object(pack.Zip, 'stream', changed), self.assertRaisesRegex(SystemExit, 'changed size while it was packed'):
+                    with patch.object(pack.Zip, 'stream', changed), patch.object(pack, 'PART', 4096), self.assertRaisesRegex(SystemExit, 'changed size while it was packed'):
                         self.run_pack(None, *(['--store', 'exe'] if store else []), big=1024)
                     self.assertEqual(self.out.read_bytes(), before); self.assertEqual(Path(str(self.out) + '.idx').read_bytes(), index)
                     for suffix in ('.partial', '.clone'): self.assertFalse(Path(str(self.out) + suffix).exists())
@@ -294,10 +324,10 @@ class PackIpa(unittest.TestCase):
                 self.assertEqual(len(loaded.call_args_list), 6 - expected)
                 self.assertTrue(all(any(Path(call.args[0]).is_relative_to(root) for root in unsafe) for call in loaded.call_args_list))
                 for arc, root in (mapping.split('=', 1) for mapping in self.maps):
-                    message = f'reuse off for {arc}: not APFS'
+                    message = f'reuse off for {arc}: {filesystem.decode() or "unknown"} file system'
                     self.assertEqual(self.output.count(message), int(root in unsafe))
                     if root in unsafe: self.assertIn(message, self.output.splitlines()[-1])
-                if expected == 4: self.assertGreater(self.kept, self.offset('romfs/text.txt'))
+                if expected == 4: self.assertKeptAbove(self.offset('romfs/text.txt'))
                 self.same_as_fresh()
 
     def test_progress_excludes_kept_bytes(self):

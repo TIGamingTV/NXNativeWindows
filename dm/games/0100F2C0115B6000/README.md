@@ -82,6 +82,7 @@ Game-specific findings. The general host changes they led to are listed under [F
 
 ## Found on this game
 
+- [Packing a large RomFS image takes many minutes on one core, and every repack off APFS deflates it again](../../../docs/reference/packing.md#packing-a-large-romfs-image-takes-many-minutes-on-one-core-and-every-repack-off-apfs-deflates-it-again) (2026-11-04, Windows): the 17 GB image was deflated on one core, and again on every rebuild.
 - [A game file whose extension is in capitals is not found](../../../docs/reference/packing.md#a-game-file-whose-extension-is-in-capitals-is-not-found) (2026-11-04, LNPANDY/NX2Apple#554): its `.NSP` stopped the build on a Mac.
 - [macOS Game Mode holds the GPU at its lowest clock](../../../docs/reference/frame-rate.md#macos-game-mode-holds-the-gpu-at-its-lowest-clock) (2026-11-04, #349): the Mac's fall to 30 fps at 338 MHz; a new Mac app opts out, a re-packed one needs the Game Overlay switch once.
 - [A regress run stops when another app takes the key window](../../../docs/reference/frame-rate.md#a-regress-run-stops-when-another-app-takes-the-key-window): the route's intermittent "hang" was the game paused out of focus (resolved).

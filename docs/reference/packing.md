@@ -48,6 +48,13 @@
 - **Fix:** count uncompressed bytes as they are read and compare them with the listed size before completing either streamed method. A mismatch stops the pack and removes the partial archive, preserving the previous IPA and its reuse index. Regression tests cover growth and shrinkage with both deflate and store.
 - **Found on:** synthetic IPA inputs while reviewing [PR #279](https://github.com/seedds/nxnative/pull/279); no game files required.
 
+### Packing a large RomFS image takes many minutes on one core, and every repack off APFS deflates it again
+
+- **Symptom:** the IPA pack stage of a big game (a 17 GB RomFS image) runs for many minutes with one CPU core busy. A rebuild that changes only the app takes as long again on Windows, Linux and non-APFS Mac volumes (the summary line says `reuse off for …: not APFS`).
+- **Cause:** `pack_ipa.py` read and deflated files above `BIG` (256 MB) on its writer thread with one compressor, so the one `romfs.img` entry used one core however many the pool had. Reuse of the old IPA's compressed entries was allowed only on APFS, though NTFS, ReFS, ext4, XFS and Btrfs also change a file's mtime with its content. With reuse on, Windows also refused the final `os.replace` while the old IPA was still open.
+- **Fix:** a big file is deflated by the pool in `PART` pieces (pigz's method): each piece's compressor is primed with the 32 KB before it (`zdict`), and every piece but the last ends with a sync flush, so the pieces form one ordinary deflate stream. The ratio is that of a single compressor (a 1 GB synthetic image came out 12 KB smaller), and the "not smaller: stored" rule is unchanged. Reuse is allowed on the file systems in `REUSE_FS` (found with `GetVolumeInformationW` on Windows and `/proc/self/mountinfo` on Linux). Without APFS clones, reused entries are copied compressed. The old IPA is closed before the rename. On Windows, `ctime` is the creation time and `scandir` gives no file ID, so only size and mtime detect a change there. Tests in `dm/ios/tests/test_pack_ipa.py` cover pieces of several sizes, the stored fallback and size changes during the pieced stream. They also run off APFS now, where kept bytes are expected to be 0.
+- **Found on:** [Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md#files-and-shaders) on Windows: a reported build of over an hour for a 17 GB IPA. Measured here on Linux only, with a synthetic 1 GB image on 4 cores: 23 s → 6 s for a fresh pack, and 4 s for a repack that reuses it. No Windows timing yet.
+
 ## RomFS images
 
 ### RomFS folder transfers fail or leave stale game files
@@ -91,6 +98,13 @@
 - **Cause:** `shader_split.py`'s `unzs` read a `.zs` file through `romfs.open`, which reads inside the image, but then handed its path to the `zstd` command, which can only open real files (`Not a directory`).
 - **Fix:** `unzs` feeds the command the bytes it read (`input=`). No other tool hands an external command a path inside the image. Test: `test_romfs_read.py` `test_zstd_file_inside_an_image`.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md#shaders): every file of its RomFS is zstd-compressed, 13,744 left out in both versions; the first image-backed build after the folder extraction.
+
+### RomFS mods stop the Windows build of every NSP game
+
+- **Symptom:** with a `mods/<name>/romfs/` folder beside the game files, the Windows app build stops with `mods' RomFS folders are laid over a RomFS folder, and this extraction is one RomFS image (RomFS.img)`.
+- **Cause:** `win/mods.py` could lay mods only over a RomFS folder (with hard links), while the NSP script always extracts a RomFS image (`nx_extract --romfs-image`). Only `exefs` mods worked.
+- **Fix:** `mods.overlay_image` writes a new image (`build/romfs_mods.img` in the IPA work folder). Its directories are breadth-first, with each directory's children sorted by name, as `dm/tools/romfs_image.py` lays them out. The game's files are copied from the image with their damaged-file flags. Mod files replace the game's (matched without regard to case, keeping the game's name) or are added. The image is reused while the image, the mods and the overlay code are unchanged. Folder extractions keep the hard-link overlay. `win/tests/test_win.py ModsImage` covers replacement, addition, flags and reuse.
+- **Found on:** code review of the Windows build path (no game). The image costs one copy of the RomFS (17 GB for Tears of the Kingdom) whenever the mods change.
 
 ### Windows scanners cannot open files inside a RomFS image
 

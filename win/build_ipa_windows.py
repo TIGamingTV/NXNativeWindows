@@ -44,6 +44,7 @@ def main():
     # AttributeError: module 'signal' has no attribute 'pthread_sigmask'). One worker per module takes in_parallel's sequential path; the modules are still rewritten
     # side by side, one process each (build_ipa_from_nsp.py rewrite), so the cores stay busy on a game of several modules
     if os.name == 'nt': os.environ['DM_REWRITE_J'] = '1'
+    split_j = os.environ.get('J') or str(os.cpu_count() or 4)   # the shader split's workers: Python processes that decompress and scan, one per core (an explicit J is taken as it is)
     os.environ.setdefault('J', str(max(8, 2 * (os.cpu_count() or 4))))   # dmsh_build.py's workers (upstream 8): on Windows each shader compile is mostly metal.exe starting up, so twice the cores keep the CPU busy
     # Windows builds get their own bundle IDs (org.nxnativewindows.<title ID>), so they install beside a Mac-built IPA of the same game; --bundle-id still names any ID
     if not any(a == '--bundle-id' or a.startswith('--bundle-id=') for a in sys.argv):
@@ -74,13 +75,10 @@ def main():
     up.check_prereqs = check_prereqs
 
     def build_nx_extract(repo, work, logs, env):
-        import tempfile, shutil
-        nx = work / 'tools/nx_extract/nx_extract'
-        with tempfile.TemporaryDirectory(prefix='nx_extract_') as t:
+        def build(t):
             up.run(['dotnet', 'build', repo / 'dm/tools/nx_extract', '-c', 'Release', '-o', t, '-v', 'quiet', '-nologo'], logs / 'nx_extract_build.log', env=env)
-            if not (Path(t) / 'nx_extract.exe').exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
-            up.rmtree(nx.parent); shutil.copytree(t, nx.parent)
-        return nx   # Windows starts nx_extract.exe for this path
+            if not (t / 'nx_extract.exe').exists(): raise BuildError(f'nx_extract built without an executable (see {logs / "nx_extract_build.log"})')
+        return up.nx_extract_cached(repo, work / 'tools/nx_extract/nx_extract', env, build)   # Windows starts nx_extract.exe for this path; reused while its sources and the .NET SDK are unchanged
     if tc.WINDOWS: up.build_nx_extract = build_nx_extract   # on Linux dotnet writes nx_extract, as upstream expects
 
     # address-region cuts for an sdk build sdk_patches.py does not register (win/sdk_auto_cuts.py), for a game with virtual address memory: written beside the rewrite, read by the
@@ -309,6 +307,13 @@ def main():
                 up.say(f'romfs_marker: {old} is not in {ver}\'s RomFS; the derived profile uses {new}')
         return disp
     up.derive_profile = derive_profile
+
+    # The split's J: its workers are Python processes (spawned on Windows, each importing the readers) that decompress and scan the game files, CPU and memory bound, so twice the cores
+    # (the J above, for metal.exe's start-up time) only doubles the memory of the zstd frames in flight (Tears of the Kingdom: 17 GB of RomFS). The split's reuse key does not include J
+    orig_split = up.split_shaders
+    def split_shaders(py, repo, roms, mains, pkg, env, *rest, **kw):
+        return orig_split(py, repo, roms, mains, pkg, dict(env, J=split_j), *rest, **kw)
+    up.split_shaders = split_shaders
 
     import love_shaders
     def capture_shaders(repo, d, patched, work, env, logs, g, api):
