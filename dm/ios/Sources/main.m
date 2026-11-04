@@ -45,7 +45,7 @@ static int romfs_identity_accepts(NSString *img) {
     if (rc != ROMFS_ID_OK && rc != ROMFS_ID_NONE) fprintf(stderr, "[RED] boot: Documents/%s is not the image this build needs (verdict %d); not used\n", img.lastPathComponent.UTF8String, rc);
     return rc == ROMFS_ID_OK || rc == ROMFS_ID_NONE;
 }
-// The images in Documents: romfs.img in any letter case, romfs.img itself first. The NSP script writes the image as RomFS.img (extract/<version>/RomFS.img) and the Mac's
+// The images in a folder (Documents, or a split build's data folder in it): romfs.img in any letter case, romfs.img itself first. The NSP script writes the image as RomFS.img (extract/<version>/RomFS.img) and the Mac's
 // file system ignores letter case, but iOS's does not: a copy made through Finder or the Files app keeps the source's name, which an exact lookup of romfs.img never finds
 static NSArray<NSString *> *romfs_document_images(NSString *doc) {
     NSMutableArray<NSString *> *imgs = [NSMutableArray array];
@@ -76,6 +76,7 @@ static NSString *romfs_locate(NSString *prog) {   // prog: a game of several pro
             NSFileManager *bfm = [NSFileManager new];
             for (NSString *n in [bfm contentsOfDirectoryAtPath:tmp error:nil]) if ([n hasPrefix:@"romfs-old-"]) [bfm removeItemAtPath:[tmp stringByAppendingPathComponent:n] error:nil];
         });
+        g_data_root = doc;   // a split build's data folder copied as its contents (romfs.img, msl/, aoc/ in Documents): data_dir takes msl/ and aoc/ from here when they are there, else the App's
         return img;
     }
     NSString *bundledImage = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"romfs.img"];
@@ -89,6 +90,9 @@ static NSString *romfs_locate(NSString *prog) {   // prog: a game of several pro
     }
     [roots addObject:NSBundle.mainBundle.resourcePath];
     for (NSString *r in roots) {   // only a directory containing the game profile's romfs_marker path counts (Mario: System/Resource, the resource size table)
+        if (![r isEqualToString:NSBundle.mainBundle.resourcePath])   // a split build whose extraction is one image (win/build_app.py): <Documents>/<Game>-data/romfs.img
+            for (NSString *img in romfs_document_images(r))
+                if (romfs_image_complete(img) && romfs_identity_accepts(img)) { g_data_root = r; return img; }
         NSString *d = [r stringByAppendingPathComponent:@"romfs"];
         if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@(DM_GAME_ROMFS_MARKER)]]) { g_data_root = r; return d; }
     }

@@ -117,7 +117,7 @@ static void import_progress(void *ctx, uint64_t done, uint64_t total, uint64_t f
     }
     if (ip.section != 2) return;
     self.status = nxw_data_found() ? @"Found. Close the app fully (swipe it away in the app switcher) and open it again to play."
-                                   : @"Not found yet. A large folder can take several minutes to copy; check that romfs is inside it.";
+                                   : @"Not found yet. A large folder can take several minutes to copy; check that romfs (or romfs.img) is inside it.";
     [tv reloadSections:[NSIndexSet indexSetWithIndex:2] withRowAnimation:UITableViewRowAnimationNone];
 }
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)pk { fprintf(stderr, "import: picker cancelled\n"); }
@@ -215,7 +215,7 @@ static void import_progress(void *ctx, uint64_t done, uint64_t total, uint64_t f
         BOOL ok = !rc && nxw_data_found();
         if (ok && [url.path hasPrefix:doc]) { [fm removeItemAtURL:url error:nil]; fprintf(stderr, "import: removed the imported ZIP from Documents (its space is free again)%c", 10); }
         if (ok) msg = @"Done. Close the app and open it again: the launcher appears, then press Play. The ZIP can be deleted now.";
-        else if (!rc) msg = @"Extracted, but the game files were not found in it: the ZIP must hold the data folder (romfs inside).";
+        else if (!rc) msg = @"Extracted, but the game files were not found in it: the ZIP must hold the data folder (romfs or romfs.img inside).";
         else msg = [NSString stringWithFormat:@"Import stopped: %s. Nothing was left half-written; try again.", e2];
         fprintf(stderr, "import: %s\n", msg.UTF8String);
         g_task_progress = nil;
@@ -241,7 +241,7 @@ void nxw_show_data_help(UIViewController *root) {
     NSString *name = [info(@"CFBundleDisplayName") isKindOfClass:NSString.class] ? info(@"CFBundleDisplayName") : @"this app";
     NxwDataHelpVC *list = [[NxwDataHelpVC alloc] initWithStyle:UITableViewStyleInsetGrouped];
     list.steps = @[
-        @[@"Find the data folder", [NSString stringWithFormat:@"On your PC, next to the IPA: \"%@\"%@ (romfs, msl and aoc inside).", folder, size ? [NSString stringWithFormat:@", %@", size] : @""]],
+        @[@"Find the data folder", [NSString stringWithFormat:@"On your PC, next to the IPA: \"%@\"%@ (romfs or romfs.img, msl and aoc inside).", folder, size ? [NSString stringWithFormat:@", %@", size] : @""]],
         @[@"From Windows", [NSString stringWithFormat:@"Apple Devices app (or iTunes) → this device → Files → %@ → drag the whole folder in.", name]],
         @[@"Or on this device", [NSString stringWithFormat:@"Files app → On My %@ → %@ → paste the folder (from a USB drive, a network share or iCloud Drive).", UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad ? @"iPad" : @"iPhone", name]],
         @[@"Restart the app", @"Close the app fully and open it again. The launcher appears, then press Play."],

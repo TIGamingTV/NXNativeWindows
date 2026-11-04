@@ -238,11 +238,12 @@ def list_files(src):
 
 
 def split_data(data, parts, stamp, name, skip_suffix=()):
-    """Fill the data folder of a split build: {path inside it: source folder}. Files are hard-linked (no disk space) on several threads, and copied where links fail
+    """Fill the data folder of a split build: {path inside it: source folder, or a source file (romfs.img: the extraction's RomFS image)}. Files are hard-linked (no disk space) on several threads, and copied where links fail
     (another drive). A folder that a build with the same stamp and the same files filled is kept as it is; otherwise it is made again in <folder>.partial and swapped in,
     so it never mixes files from two builds. Returns (files, bytes)"""
     import concurrent.futures as cf
-    todo = [(f, f'{rel}/{r}', n) for rel, src in parts.items() for f, r, n in list_files(src) if not r.endswith(tuple(skip_suffix))]
+    todo = [(f, f'{rel}/{r}', n) for rel, src in parts.items() if not Path(src).is_file() for f, r, n in list_files(src) if not r.endswith(tuple(skip_suffix))]
+    todo += [(str(src), rel, Path(src).stat().st_size) for rel, src in parts.items() if Path(src).is_file()]
     count, size = len(todo), sum(n for _, _, n in todo)
     sig = stamp + f'files\t{count}\nbytes\t{size}\n'
     if (data / 'nxw_data.tsv').is_file() and (data / 'nxw_data.tsv').read_text(encoding='utf-8') == sig:
@@ -416,7 +417,6 @@ def main():
     lang = env.get('DM_LANG') or 'en-US'
 
     if image and env.get('NXW_MODS_ROMFS'): die('mods\' RomFS folders are laid over a RomFS folder, and this extraction is one RomFS image (RomFS.img)')
-    if image and env.get('NXW_SPLIT_DATA', '') not in ('', '0'): die('a split build copies the RomFS as a folder, and this extraction is one RomFS image (RomFS.img): build without --split-data')
     if env.get('NXW_MODS_ROMFS'):   # mods' RomFS folders (win/mods.py): hard links of the game's files with the mods' laid over them
         import mods
         romfs = p0.romfs = mods.overlay_romfs(romfs, env['NXW_MODS_ROMFS'].split(os.pathsep), w / 'build/romfs_mods', log=t)
@@ -514,7 +514,8 @@ def main():
         sp = env.get('NXW_SPLIT_DATA', '')
         if sp and sp != '0':   # a split build: the app's "game data needed" screen (win/ios/DataHelp.m) names the data folder and its size
             dname = Path(sp).name if sp not in ('1', 'YES') else out_ipa.stem + '-data'
-            dsize = sum(n for d in (romfs, msl_ios / msldir, aoc if aoc and aoc.is_dir() else None) if d for _, _, n in list_files(d))   # listed once, reused by split_data
+            dsize = sum(n for d in (None if image else romfs, msl_ios / msldir, aoc if aoc and aoc.is_dir() else None) if d for _, _, n in list_files(d))   # listed once, reused by split_data
+            if image: dsize += Path(str(romfs)).stat().st_size
             pl['NXWDataFolder'] = dname; pl['NXWDataSize'] = f'{dsize / 2**30:.1f} GB' if dsize >= 2**30 else f'{dsize / 2**20:.0f} MB'
         plistlib.dump(pl, f, fmt=plistlib.FMT_BINARY)
     (app / 'PkgInfo').write_bytes(b'APPL????')
@@ -540,9 +541,10 @@ def main():
                 if (p.extra / d).is_dir(): maps.append(f'{P}/{p.tag}/{d}={p.extra / d}'); t(f'program {p.n}: {d}/ from {p.extra / d}')
     elif split and split != '0':
         # Split build: the IPA holds only the app (small, quick to sign and install); the game files and shader libraries go to a data folder the player copies
-        # into the app's Documents (dm/ios/Sources/main.m looks for <Documents>/romfs and <Documents>/<folder>/romfs, and takes msl/ and aoc/ beside it)
+        # into the app's Documents (dm/ios/Sources/main.m looks for <Documents>/romfs(.img) and <Documents>/<folder>/romfs(.img), and takes msl/ and aoc/ beside it).
+        # The RomFS goes as the extraction has it: the romfs folder, or one image (RomFS.img, the NSP script's and the NUP / dump packers' extraction) as romfs.img
         data = Path(split) if split not in ('1', 'YES') else out_ipa.with_name(out_ipa.stem + '-data')
-        split_data(data, {'romfs': romfs, f'msl/{msldir}': msl_ios / msldir, **({'aoc': aoc} if has_aoc else {})},
+        split_data(data, {('romfs.img' if image else 'romfs'): Path(str(romfs)) if image else romfs, f'msl/{msldir}': msl_ios / msldir, **({'aoc': aoc} if has_aoc else {})},
                    f'game\t{game}\nbundle_id\t{bundle_id}\nversion\t{version}\nchain\t{v}\ngfx\t{gfx}\n', name, skip_suffix=('_bp.metallib',) if skip_bp else ())
         for d in ('html', 'jit'):   # small, and read from the app (hle_web.c, loader.c dm_jit_serve_dir): they stay in the IPA
             if (p0.extra / d).is_dir(): maps.append(f'{P}/{d}={p0.extra / d}')
