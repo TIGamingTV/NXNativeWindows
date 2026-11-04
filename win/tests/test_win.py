@@ -57,6 +57,25 @@ class Shim(unittest.TestCase):
             self.assertIn('guest .dm-case-1', r.stdout)
 
 
+class Rewriter(unittest.TestCase):
+    def test_one_worker_needs_no_fork_or_sigmask(self):
+        """win/build_ipa_windows.py sets DM_REWRITE_J=1 on Windows: dm/tools/patch_nso.py in_parallel must then take its sequential path, which needs neither a 'fork' pool nor
+        signal.pthread_sigmask (Windows has neither). The rewriter's real function, extracted as dm/tools/tests/test_rewrite_parallel.py extracts it, run with both taken away"""
+        import ast
+        tree = ast.parse((REPO / 'dm/tools/patch_nso.py').read_text(encoding='utf-8'))
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'in_parallel')
+        code = ('import multiprocessing, signal\nWORKERS = 1\n'
+                'if hasattr(signal, "pthread_sigmask"): del signal.pthread_sigmask\n'
+                'multiprocessing.get_context = lambda *a: (_ for _ in ()).throw(ValueError("no fork"))\n'
+                + ast.unparse(fn) + '\nprint(in_parallel(lambda a, b: a + b, [(1, 2), (3, 4), (5, 6)]))\n')
+        r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr); self.assertEqual(r.stdout.strip(), '[3, 7, 11]')
+
+    def test_driver_sets_one_worker_on_windows(self):
+        src = (WIN / 'build_ipa_windows.py').read_text(encoding='utf-8')
+        self.assertIn("if os.name == 'nt': os.environ['DM_REWRITE_J'] = '1'", src)
+
+
 class HostSources(unittest.TestCase):
     def test_matches_makefile(self):
         files, incs = build_app.host_sources(Path('gen/x'))
