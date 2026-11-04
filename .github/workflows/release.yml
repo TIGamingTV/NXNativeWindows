@@ -1,0 +1,22 @@
+# Publishes a release of this Windows port: Actions > release > Run workflow, with the tag to create. The notes are docs/releases/<tag>.md, the tag goes on the commit the run starts from.
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create (its notes: docs/releases/<tag>.md)'
+        required: true
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          test -f "docs/releases/$TAG.md" || { echo "no docs/releases/$TAG.md"; exit 1; }
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "NXNativeWindows $TAG" --notes-file "docs/releases/$TAG.md"
