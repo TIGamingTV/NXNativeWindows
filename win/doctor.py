@@ -20,10 +20,11 @@ def checks():
     if tc.WINDOWS: add('Windows', True, sys.platform)
     else: add('Linux with Wine (runs the Windows Metal compiler)', tc.wine(), tc.wine() or 'wine not found', 'install wine (apt install wine64), or set "wine" in win/toolchain.json')
     add('Python 3.10+', sys.version_info >= (3, 10), sys.version.split()[0], 'https://www.python.org/downloads/')
-    for m, pip in (('lz4.block', 'lz4'), ('capstone', 'capstone'), ('fontTools', 'fonttools'), ('PIL', 'pillow')):
+    # zbic: Nintendo's zstd variant (ZBIC) in the code modules of system 22.0.0 and later, which Switch 2 games ship (dm/tools/nso.py); only those games need it
+    for m, pip in (('lz4.block', 'lz4'), ('capstone', 'capstone'), ('fontTools', 'fonttools'), ('PIL', 'pillow'), ('zbic', 'zbic')):
         try: importlib.import_module(m); ok = True
         except ImportError: ok = False
-        add(f'python module {m}', ok, '', f'python -m pip install {pip}', required=m != 'PIL')
+        add(f'python module {m}' + (' (Switch 2 games)' if m == 'zbic' else ''), ok, '', f'python -m pip install {pip}', required=m not in ('PIL', 'zbic'))
     zs = any(_spec_ok(m) for m in ('compression.zstd', 'backports.zstd'))
     add('python zstd (compression.zstd / backports.zstd)', zs, '', 'python -m pip install backports.zstd (Python before 3.14)')
 

@@ -120,6 +120,7 @@ class Zip:
         mode = e.st.st_mode if e.st else DIR_MODE
         if os.name == 'nt' and e.st:   # Windows has no Unix modes (files read as 0o666 without x): folders 755, the --exec files 755, everything else 644, as Info-ZIP on a Mac writes them
             mode = DIR_MODE if stat.S_ISDIR(mode) else stat.S_IFREG | (0o755 if e.name in EXEC else 0o644)
+        elif e.st and e.name in EXEC and stat.S_ISREG(mode): mode |= 0o755   # an --exec file is executable wherever it was packed from (a Linux or exFAT copy can lack the x bit)
         self.cd.append(struct.pack('<IHHHHHHIIIHHHHHII', 0x02014B50, 0x031E, 45 if z else 20 if method == 8 else 10, fl, method, t, d, crc, min(csize, L32), min(usize, L32),
                                    len(nb), len(ext), 0, 0, 0, (mode << 16) | (0x10 if stat.S_ISDIR(mode) else 0), min(off, L32)) + nb + ext)
         self.stats['deflated' if method == 8 else 'stored'] += usize

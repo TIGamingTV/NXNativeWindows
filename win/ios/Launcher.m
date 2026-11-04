@@ -7,19 +7,19 @@
 // (options [[value, label]]), "range" (min / max / step, shown as a percentage) or "toggle" (on / off: the two values the variable takes, "1" / "0" when absent).
 // A variable an env file set (DM_ENV_FILE_KEYS, main.m) is shown but kept. A row marked "disabled" (settings.tsv always/<condition>: listed for every game, but this one has
 // nothing it acts on) is shown greyed out and never applied. Only a choice that differs from the game's default is kept, in NSUserDefaults under "launcher.<ENV>", as the Swift launcher does.
+// Also a port of upstream's later additions: sub-settings drawn only while the row they need has its value ("needs"), values fixed by the launch environment (DM_ENV_LAUNCH_KEYS),
+// DM_SAVED_CHOICES=0, DM_LAUNCHER=0 applying the saved choices, an app of several programs (DM_APP_DM: the running program's dm/p<N>), cloud saves (CloudSaves.h) and the model
+// the in-game menu shows and saves (win/ios/GameMenu.m, GameMenu.swift's counterpart)
 #import <UIKit/UIKit.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import "Launcher.h"
+#import "CloudSaves.h"
 #include <math.h>
 #include <os/proc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-@interface DmSetting : NSObject
-@property (copy) NSString *env, *kind, *label, *note, *def, *section, *on, *off;
-@property (copy) NSArray<NSArray<NSString *> *> *options;   // choice: [value, label]
-@property double min, max, step; @property BOOL hasMin, hasMax, hasStep;
-@property BOOL disabled;
-@end
 @implementation DmSetting
 - (NSString *)sectionTitle { return self.section.length ? self.section : @"Game"; }
 - (NSString *)onValue { return self.on ?: @"1"; }
@@ -49,7 +49,7 @@ static NSArray<DmSetting *> *load_settings(NSData *data) {   // nil when the fil
         if (![d isKindOfClass:NSDictionary.class]) return nil;
         DmSetting *s = [DmSetting new];
         s.env = str(d, @"env"); s.kind = str(d, @"kind"); s.label = str(d, @"label"); s.note = str(d, @"note"); s.def = str(d, @"default");
-        s.section = str(d, @"section"); s.on = str(d, @"on"); s.off = str(d, @"off");
+        s.section = str(d, @"section"); s.on = str(d, @"on"); s.off = str(d, @"off"); s.needs = str(d, @"needs");
         if (!s.env || !s.kind || !s.label || !s.note || !s.def) return nil;
         if ([d[@"options"] isKindOfClass:NSArray.class]) {
             NSMutableArray *opts = [NSMutableArray array];
@@ -71,12 +71,15 @@ static NSArray<DmSetting *> *load_settings(NSData *data) {   // nil when the fil
 static int increased_memory_limit(void);
 
 // ---- model (LauncherSettings.swift's LauncherModel) ----
-@interface DmLauncherModel : NSObject
-@property (strong) NSArray<DmSetting *> *settings;
-@property (strong) NSArray<NSString *> *sections;
-@property (strong) NSSet<NSString *> *fromFile;   // set by an env file: shown, not changed
-@property (strong) NSMutableDictionary<NSString *, NSString *> *values;
+@interface DmLauncherModel ()
+- (instancetype)initWith:(NSArray<DmSetting *> *)settings;
+- (BOOL)changed;
+- (void)reset;
+- (void)apply;
+- (void)applySaved;
 @end
+static DmLauncherModel *g_model;   // the in-game menu's (nxw_launcher_model)
+DmLauncherModel *nxw_launcher_model(void) { return g_model; }
 @implementation DmLauncherModel
 - (instancetype)initWith:(NSArray<DmSetting *> *)settings {
     if (!(self = [super init])) return nil;
@@ -84,10 +87,14 @@ static int increased_memory_limit(void);
     NSMutableArray *secs = [NSMutableArray array];
     for (DmSetting *s in settings) if (![secs containsObject:s.sectionTitle]) [secs addObject:s.sectionTitle];
     _sections = secs;
-    NSString *keys = NSProcessInfo.processInfo.environment[@"DM_ENV_FILE_KEYS"] ?: @"";
-    NSMutableSet *ff = [NSMutableSet set];
-    for (NSString *k in [keys componentsSeparatedByString:@" "]) if (k.length) [ff addObject:k];
-    _fromFile = ff;
+    NSDictionary *env = NSProcessInfo.processInfo.environment;
+    NSMutableSet *fl = [NSMutableSet set], *ff = [NSMutableSet set];
+    for (NSString *k in [env[@"DM_ENV_LAUNCH_KEYS"] ?: @"" componentsSeparatedByString:@" "]) if (k.length) [fl addObject:k];   // set at launch (main.m): shown, not changed
+    [ff unionSet:fl];
+    for (NSString *k in [env[@"DM_ENV_FILE_KEYS"] ?: @"" componentsSeparatedByString:@" "]) if (k.length) [ff addObject:k];
+    _fromFile = ff; _fromLaunch = fl;
+    _ignoreSaved = [env[@"DM_SAVED_CHOICES"] isEqualToString:@"0"];   // start from the defaults, and leave the saved choices as they are
+    if (_ignoreSaved) fprintf(stderr, "launcher: saved choices ignored (DM_SAVED_CHOICES=0)\n");
     // A device with 6 GB of memory or less (an A16 iPad, an iPhone 15): the defaults that hold the least memory, Handheld (most games render 720p instead of 1080p) and,
     // where the game has a render-scale hook, 75 % of its 3D size. Only the defaults change: a choice the player made stays, and Reset brings back these
     if (NSProcessInfo.processInfo.physicalMemory <= 6.5 * 1024 * 1024 * 1024) {
@@ -116,19 +123,28 @@ static int increased_memory_limit(void);
     for (DmSetting *s in settings) {
         NSString *envv = NSProcessInfo.processInfo.environment[s.env];
         if ([ff containsObject:s.env] && envv) { _values[s.env] = envv; continue; }
-        NSString *saved = [ud stringForKey:[@"launcher." stringByAppendingString:s.env]];
+        id so = _ignoreSaved ? nil : [ud objectForKey:[@"launcher." stringByAppendingString:s.env]];
+        NSString *saved = [so isKindOfClass:NSString.class] ? so : nil;   // a string, as launcher.c reads it
         _values[s.env] = (saved && [s accepts:saved]) ? saved : s.def;   // a saved choice the game no longer offers: its default
     }
     return self;
 }
+// A row with "needs" is a sub-setting of the row it names: drawn only while that setting has that value (LauncherSettings.swift visible); a row naming a setting this game does not
+// have stays drawn
+- (BOOL)visible:(DmSetting *)s {
+    NSRange eq = s.needs ? [s.needs rangeOfString:@"="] : NSMakeRange(NSNotFound, 0);
+    if (eq.location == NSNotFound) return YES;
+    NSString *v = self.values[[s.needs substringToIndex:eq.location]];
+    return !v || [v isEqualToString:[s.needs substringFromIndex:eq.location + 1]];
+}
 - (NSArray<DmSetting *> *)inSection:(NSString *)sec {
-    return [self.settings filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(DmSetting *s, NSDictionary *b) { return [s.sectionTitle isEqualToString:sec]; }]];
+    return [self.settings filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(DmSetting *s, NSDictionary *b) { return [s.sectionTitle isEqualToString:sec] && [self visible:s]; }]];
 }
 - (NSString *)value:(DmSetting *)s { return self.values[s.env] ?: s.def; }
 - (BOOL)locked:(DmSetting *)s { return s.disabled || [self.fromFile containsObject:s.env]; }
 - (NSString *)note:(DmSetting *)s {
     if (s.disabled || ![self.fromFile containsObject:s.env]) return s.note;
-    return [NSString stringWithFormat:@"%@Set by an env file", s.note.length ? [s.note stringByAppendingString:@" · "] : @""];
+    return [NSString stringWithFormat:@"%@Set by %@", s.note.length ? [s.note stringByAppendingString:@" · "] : @"", [self.fromLaunch containsObject:s.env] ? @"the launch environment" : @"an env file"];
 }
 - (double)rangeValue:(DmSetting *)s {
     NSString *v = [self value:s]; NSScanner *sc = [NSScanner scannerWithString:v]; double d;
@@ -144,25 +160,41 @@ static int increased_memory_limit(void);
     for (DmSetting *s in self.settings) if (!s.disabled && ![self.fromFile containsObject:s.env] && ![s isDefault:[self value:s]]) return YES;
     return NO;
 }
-- (void)reset {   // every launcher choice back to the game's defaults; an env file's values stay
-    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    for (DmSetting *s in self.settings) {
-        [ud removeObjectForKey:[@"launcher." stringByAppendingString:s.env]];
-        if (![self.fromFile containsObject:s.env]) self.values[s.env] = s.def;
-    }
+// Every launcher choice back to the game's defaults on the screen; values fixed by an env file or at launch stay. The saved choices are forgotten when Play applies the defaults
+// (apply keeps no default), so a choice a launch override hides is kept
+- (void)reset {
+    for (DmSetting *s in self.settings) if (![self.fromFile containsObject:s.env]) self.values[s.env] = s.def;
     fprintf(stderr, "launcher: settings reset to the game's defaults\n");
 }
 // Before the game starts: every setting not set by an env file goes into the environment (DM_LANG replaces the packed language main.m set as a default). Only a choice that
 // differs from the game's default is stored: a setting the player left at its default follows the defaults of a later build (the settings it was tested with)
+- (void)store:(DmSetting *)s value:(NSString *)v {
+    if (self.ignoreSaved) return;
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults; NSString *key = [@"launcher." stringByAppendingString:s.env];
+    if ([s isDefault:v]) [ud removeObjectForKey:key]; else [ud setObject:v forKey:key];
+}
 - (void)apply {
-    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     for (DmSetting *s in self.settings) {
-        NSString *v = [self value:s], *key = [@"launcher." stringByAppendingString:s.env];
+        NSString *v = [self value:s];
         if (s.disabled) continue;   // nothing in this game reads it
-        if ([self.fromFile containsObject:s.env]) { fprintf(stderr, "launcher: %s kept at %s (env file)\n", s.env.UTF8String, v.UTF8String); continue; }
-        BOOL def = [s isDefault:v];
-        if (def) [ud removeObjectForKey:key]; else [ud setObject:v forKey:key];
-        setenv(s.env.UTF8String, v.UTF8String, 1); fprintf(stderr, "launcher: %s=%s%s\n", s.env.UTF8String, v.UTF8String, def ? "" : " (changed)");
+        if ([self.fromFile containsObject:s.env]) { fprintf(stderr, "launcher: %s kept at %s (%s)\n", s.env.UTF8String, v.UTF8String, [self.fromLaunch containsObject:s.env] ? "launch environment" : "env file"); continue; }
+        [self store:s value:v];
+        setenv(s.env.UTF8String, v.UTF8String, 1); fprintf(stderr, "launcher: %s=%s%s\n", s.env.UTF8String, v.UTF8String, [s isDefault:v] ? "" : " (changed)");
+    }
+}
+// A choice made while the game runs (the in-game menu, GameMenu.m): saved as Play saves it, so the settings screen shows it at the next start, and put in the environment.
+// A value an env file or the launch fixed stays
+- (void)choose:(DmSetting *)s value:(NSString *)v {
+    if ([self locked:s] || ![s accepts:v]) return;
+    self.values[s.env] = v; [self store:s value:v]; setenv(s.env.UTF8String, v.UTF8String, 1);
+    fprintf(stderr, "launcher: %s=%s (in-game menu)\n", s.env.UTF8String, v.UTF8String);
+}
+// DM_LAUNCHER=0: no screen, but the saved choices still apply (only DM_SAVED_CHOICES=0 ignores them); nothing is written
+- (void)applySaved {
+    for (DmSetting *s in self.settings) {
+        if (s.disabled || [self.fromFile containsObject:s.env]) continue;
+        NSString *v = [self value:s];
+        if (![s isDefault:v]) { setenv(s.env.UTF8String, v.UTF8String, 1); fprintf(stderr, "launcher: %s=%s (saved choice)\n", s.env.UTF8String, v.UTF8String); }
     }
 }
 @end
@@ -212,8 +244,9 @@ static int increased_memory_limit(void) {
 }
 
 // ---- the settings list ----
-@interface DmSettingsVC : UITableViewController
+@interface DmSettingsVC : UITableViewController <UIDocumentPickerDelegate>
 @property (strong) DmLauncherModel *m; @property (strong) NSTimer *timer; @property (strong) UILabel *memory;
+@property (copy) NSString *cloudNote;   // the Cloud saves footer after a pick (Launcher.swift CloudSavesSection)
 @end
 @implementation DmSettingsVC
 - (void)viewDidLoad {
@@ -225,12 +258,25 @@ static int increased_memory_limit(void) {
 }
 - (void)dealloc { [self.timer invalidate]; }
 - (NSInteger)resetSection { return self.m.sections.count; }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return self.m.sections.count + 2; }   // the sections, Reset, Memory available
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)sec { return sec < (NSInteger)self.m.sections.count ? (NSInteger)[self.m inSection:self.m.sections[sec]].count : sec > self.resetSection ? 2 : 1; }
+- (NSInteger)cloudSection { return self.resetSection + 1; }
+- (NSInteger)memorySection { return self.resetSection + 2; }
+- (NSString *)cloudFolder:(BOOL *)stale { BOOL st = NO; NSString *f = dm_cloud_saves_path(&st); if (stale) *stale = st; return f ?: @""; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return self.m.sections.count + 3; }   // the sections, Reset, Cloud saves, Memory available
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)sec {
+    if (sec < (NSInteger)self.m.sections.count) return (NSInteger)[self.m inSection:self.m.sections[sec]].count;
+    if (sec == self.cloudSection) return [self cloudFolder:NULL].length ? 3 : 2;
+    return sec == self.memorySection ? 2 : 1;
+}
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)sec { return sec < (NSInteger)self.m.sections.count ? self.m.sections[sec] : nil; }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)sec {
     if (sec == self.resetSection) return @"Brings back all settings this game was tested with.";
-    if (sec > self.resetSection && !increased_memory_limit())
+    if (sec == self.cloudSection) {
+        BOOL stale = NO; NSString *f = [self cloudFolder:&stale];
+        if (self.cloudNote.length) return self.cloudNote;
+        if (stale && !f.length) return @"The folder you chose before is no longer readable (the app was signed differently). Please choose it again.";
+        return @"Choose a folder in iCloud Drive, and the same one in the Mac app's Cloud saves. The save comes in when the game starts and goes out after each save; a save that is replaced is kept in save-backups.";
+    }
+    if (sec == self.memorySection && !increased_memory_limit())
         return @"Increased Memory Limit is off: iOS gives this app less memory, and a big game can be closed when an area loads. A free Apple ID cannot turn it on (the signing app drops it); a paid developer account can. Texture memory saver (Performance) helps meanwhile.";
     return nil;
 }
@@ -248,7 +294,36 @@ static int increased_memory_limit(void) {
             [b.centerYAnchor constraintEqualToAnchor:v.centerYAnchor], [v.heightAnchor constraintGreaterThanOrEqualToConstant:48]]];
         return c;
     }
-    if (ip.section > self.resetSection && ip.row == 1) {   // Increased Memory Limit: On (green) / Off (orange)
+    if (ip.section == self.cloudSection) {   // Cloud saves: the folder, Choose, Turn off (Launcher.swift CloudSavesSection)
+        NSString *f = [self cloudFolder:NULL];
+        if (ip.row == 0) {
+            UILabel *l = body_label(@"Cloud saves"), *st = value_label(f.length ? f.lastPathComponent : @"Off");
+            st.lineBreakMode = NSLineBreakByTruncatingMiddle; [st setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+            [v addSubview:l]; [v addSubview:st];
+            [NSLayoutConstraint activateConstraints:@[[l.leadingAnchor constraintEqualToAnchor:g.leadingAnchor], [l.centerYAnchor constraintEqualToAnchor:v.centerYAnchor],
+                [st.leadingAnchor constraintGreaterThanOrEqualToAnchor:l.trailingAnchor constant:12],
+                [st.trailingAnchor constraintEqualToAnchor:g.trailingAnchor], [st.centerYAnchor constraintEqualToAnchor:v.centerYAnchor], [v.heightAnchor constraintGreaterThanOrEqualToConstant:48]]];
+            return c;
+        }
+        BOOL off = ip.row == 2;
+        UIButtonConfiguration *cfg = [UIButtonConfiguration plainButtonConfiguration]; cfg.contentInsets = NSDirectionalEdgeInsetsZero;
+        cfg.title = off ? @"Turn off cloud saves" : f.length ? @"Choose a different folder…" : @"Choose a folder in iCloud Drive…";
+        if (off) cfg.baseForegroundColor = UIColor.systemRedColor;
+        __weak DmSettingsVC *w = self;
+        UIButton *b = [UIButton buttonWithConfiguration:cfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
+            DmSettingsVC *me = w; if (!me) return;
+            if (off) { dm_clear_cloud_saves(); me.cloudNote = nil; [me.tableView reloadData]; return; }
+            // .open (not a copy): the folder stays where it is and the bookmark keeps pointing at it
+            UIDocumentPickerViewController *pk = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeFolder] asCopy:NO];
+            pk.allowsMultipleSelection = NO; pk.delegate = me;
+            [me presentViewController:pk animated:YES completion:nil];
+        }]];
+        b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading; b.translatesAutoresizingMaskIntoConstraints = NO; [v addSubview:b];
+        [NSLayoutConstraint activateConstraints:@[[b.leadingAnchor constraintEqualToAnchor:g.leadingAnchor], [b.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+            [b.centerYAnchor constraintEqualToAnchor:v.centerYAnchor], [v.heightAnchor constraintGreaterThanOrEqualToConstant:48]]];
+        return c;
+    }
+    if (ip.section == self.memorySection && ip.row == 1) {   // Increased Memory Limit: On (green) / Off (orange)
         UILabel *l = body_label(@"Increased Memory Limit");
         int on = increased_memory_limit();
         UILabel *st = value_label(on ? @"● On" : @"● Off"); st.textColor = on ? UIColor.systemGreenColor : UIColor.systemOrangeColor;
@@ -258,7 +333,7 @@ static int increased_memory_limit(void) {
             [v.heightAnchor constraintGreaterThanOrEqualToConstant:48]]];
         return c;
     }
-    if (ip.section > self.resetSection) {   // Memory available
+    if (ip.section == self.memorySection) {   // Memory available
         UILabel *l = body_label(@"Memory available");
         self.memory = value_label([NSByteCountFormatter stringFromByteCount:(long long)os_proc_available_memory() countStyle:NSByteCountFormatterCountStyleMemory]);
         [v addSubview:l]; [v addSubview:self.memory];
@@ -321,12 +396,17 @@ static int increased_memory_limit(void) {
             me.m.values[s.env] = o[0];
             UIButtonConfiguration *cfg = wb.configuration; cfg.title = o[1]; wb.configuration = cfg;
             wb.menu = [me menuFor:s button:wb];
-            [me refreshReset];
+            [me changedSetting:s];
         }];
         a.state = [o[0] isEqualToString:cur] ? UIMenuElementStateOn : UIMenuElementStateOff;
         [items addObject:a];
     }
     return [UIMenu menuWithTitle:@"" image:nil identifier:nil options:UIMenuOptionsSingleSelection children:items];
+}
+- (void)documentPicker:(UIDocumentPickerViewController *)c didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    if (!urls.firstObject) return;
+    self.cloudNote = dm_store_cloud_saves(urls.firstObject) ? @"Saved. The game uses this folder when you press Play." : @"That folder could not be remembered — try a different one.";
+    [self.tableView reloadData];
 }
 - (void)refreshReset { [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:0 inSection:self.resetSection]] withRowAnimation:UITableViewRowAnimationNone]; }
 
@@ -339,7 +419,11 @@ static int increased_memory_limit(void) {
     pct.text = [self.m percentage:s]; sl.accessibilityValue = pct.text;
 }
 - (void)slidEnd:(UISlider *)sl { [self refreshReset]; }
-- (void)toggled:(UISwitch *)sw { DmSetting *s = self.m.settings[sw.tag]; self.m.values[s.env] = sw.on ? s.onValue : s.offValue; [self refreshReset]; }
+- (void)toggled:(UISwitch *)sw { DmSetting *s = self.m.settings[sw.tag]; self.m.values[s.env] = sw.on ? s.onValue : s.offValue; [self changedSetting:s]; }
+- (void)changedSetting:(DmSetting *)s {   // a row another row needs: the sub-settings come and go, so the list is drawn again
+    for (DmSetting *o in self.m.settings) if ([o.needs hasPrefix:[s.env stringByAppendingString:@"="]]) { [self.tableView reloadData]; return; }
+    [self refreshReset];
+}
 @end
 
 // ---- the screen: game card on the left third, settings on the right two thirds ----
@@ -398,11 +482,11 @@ static UIImage *app_icon(void) {
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 @end
 
-// A capture IPA (win/build_ipa_windows.py: the run-time shader capture done on the device instead of a Mac) sets DM_GLSLC_CAPTURE / DM_VK_CAPTURE / DM_GL_CAPTURE in its dm/env.txt
+// A capture IPA (win/build_ipa_windows.py: the run-time shader or NRO capture done on the device instead of a Mac) sets DM_GLSLC_CAPTURE / DM_VK_CAPTURE / DM_GL_CAPTURE / DM_NRO_CAPTURE in its dm/env.txt
 // to a folder relative to Documents (main.m makes Documents the working directory); the Vulkan and GL captures write into the folder without making it, so it is made here, before the game starts
 static void make_capture_folders(void) {
-    static const char *const keys[] = {"DM_GLSLC_CAPTURE", "DM_VK_CAPTURE", "DM_GL_CAPTURE"};
-    for (int i = 0; i < 3; i++) {
+    static const char *const keys[] = {"DM_GLSLC_CAPTURE", "DM_VK_CAPTURE", "DM_GL_CAPTURE", "DM_NRO_CAPTURE"};   // DM_NRO_CAPTURE: a game that decodes its code at run time (hle_ro.c)
+    for (int i = 0; i < 4; i++) {
         const char *k = keys[i], *d = getenv(k);
         if (d && *d) { [NSFileManager.defaultManager createDirectoryAtPath:@(d) withIntermediateDirectories:YES attributes:nil error:nil]; fprintf(stderr, "capture: %s → Documents/%s\n", k, d); }
     }
@@ -411,14 +495,16 @@ static void make_capture_folders(void) {
 bool dm_show_launcher(void *view_controller, void (*done)(void)) {
     make_capture_folders();
     const char *off = getenv("DM_LAUNCHER");
-    if (off && !strcmp(off, "0")) { fprintf(stderr, "launcher: off (DM_LAUNCHER=0)\n"); return false; }
-    NSString *path = [[NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"dm"] stringByAppendingPathComponent:@"launcher.json"];
-    NSData *data = [NSData dataWithContentsOfFile:path];
+    const char *appdm = getenv("DM_APP_DM");   // a game of several programs (main.m): the running program's settings, in its dm/p<N>
+    NSString *dir = appdm ? @(appdm) : [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"dm"];
+    NSData *data = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"launcher.json"]];
     if (!data) return false;
     NSArray<DmSetting *> *settings = load_settings(data);
     if (!settings.count) { fprintf(stderr, "[RED] launcher: dm/launcher.json cannot be read; starting the game\n"); return false; }
-    UIViewController *parent = (__bridge UIViewController *)view_controller;
     DmLauncherModel *model = [[DmLauncherModel alloc] initWith:settings];
+    g_model = model;   // the in-game menu shows and saves the same choices (GameMenu.m)
+    if (off && !strcmp(off, "0")) { fprintf(stderr, "launcher: off (DM_LAUNCHER=0)\n"); [model applySaved]; return false; }
+    UIViewController *parent = (__bridge UIViewController *)view_controller;
     DmLauncherVC *vc = [DmLauncherVC new]; vc.m = model; vc.modalPresentationStyle = UIModalPresentationFullScreen;
     __weak DmLauncherVC *wvc = vc; __block BOOL started = NO;
     vc.play = ^{

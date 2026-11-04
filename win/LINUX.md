@@ -28,7 +28,7 @@ A venv keeps them out of the system Python:
 
 ```sh
 python3 -m venv ~/.local/venvs/nxnative
-~/.local/venvs/nxnative/bin/pip install lz4 capstone fonttools backports.zstd unicorn pillow cmake
+~/.local/venvs/nxnative/bin/pip install lz4 capstone fonttools backports.zstd unicorn pillow cmake zbic
 ```
 
 `backports.zstd` is only needed before Python 3.14. `unicorn` runs a game's own Oodle decoder (Arceus needs it), and `cmake` builds spirv-cross in step 4.

@@ -22,7 +22,7 @@ class Toolchain(unittest.TestCase):
         self.assertEqual(sorted({r for r in runners if r.startswith(('macos-', 'xcode-'))}), [image], f'tests.yml: every macOS job runs on {image} (Xcode {self.xcode})')
 
     def test_readme_names_the_same_xcode(self):
-        readme = (REPO / 'README.md').read_text()
+        readme = (REPO / ('README.nxnative.md' if (REPO / 'README.nxnative.md').is_file() else 'README.md')).read_text()   # the Windows port keeps upstream's README there; its own names the SDK it was tested with
         named = re.findall(r'\[Xcode\]\([^)]*\) (\d+\.\d+)', readme)
         self.assertEqual(set(named), {self.xcode}, f'README.md: the Xcode to install is not CI\'s {self.xcode}')
         self.assertEqual(set(re.findall(r'Xcode[ -](\d+\.\d+)', readme)), {self.xcode}, f'README.md: an Xcode it names (the side-by-side one too) is not CI\'s {self.xcode}')

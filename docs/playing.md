@@ -1,6 +1,6 @@
 # Playing
 
-How to build and install a game: [README](../README.md#how-to-play).
+How to build and install a game: [README](../README.md) (this Windows port), or [upstream's README](../README.nxnative.md#how-to-play) on a Mac.
 
 - **Settings:** a screen before the game starts sets frame rate, resolution, docked or handheld mode, language, rumble and more. Tap **Play**; your choices are remembered. What each one does: [Settings](settings.md).
 - **Saves and logs** are in the Files app, under the game's name: `save/` and `log.txt` (the previous run is `log.prev.txt`). When something goes wrong, send `log.txt`.
@@ -13,6 +13,18 @@ The gear at the top centre opens the in-game menu: **Controller layout** switche
 In 3D, the right stick (the camera in most games) is not drawn: swipe on the right third of the screen, starting anywhere off the buttons. In Super Mario Galaxy and Super Mario Galaxy 2, other touches outside the controls move the pointer; in Captain Toad: Treasure Tracker they touch the game's screen (touch blocks, stun enemies), and in Big Brain Academy: Brain vs. Brain too (its menus and activities).
 
 A connected game controller hides the touch controls, all but the gear, and keeps every button.
+
+### Edit the touch controls
+
+**Edit touch controls…** in the in-game menu (under **Controller layout**) lets you lay the controls out as you like. The game keeps running behind it, and no touch reaches it while you edit.
+
+- **Move:** drag any control: a shoulder button, − / +, L3 / R3, the A B X Y diamond, the D-pad, the left stick, or the gear itself. A yellow frame shows which one is selected.
+- **Resize:** the slider in the editor's bar sets the selected control's size, from half to twice the standard size.
+- **Hide:** **Hide** takes a control off the screen (it no longer takes touches). While you edit it stays faint, so you can select it and press **Show**. The gear cannot be hidden: it opens the menu.
+- **Shortcuts:** **Shortcut** adds a button that presses several buttons at once, for example ZL + A or L + R. Choose its buttons, a label (empty: the buttons joined with +) and what a touch does: **Hold** presses them while your finger is on it, **Toggle** presses them with one tap and releases them with the next. Shortcuts take a touch before the standard controls, so one can sit over another control. Select a shortcut to change it (**Buttons…**), resize it or **Delete** it.
+- **Reset** puts every control back in its standard place and size and removes this layout's shortcuts. **Done** closes the editor.
+
+Changes are saved as you make them. 2D and 3D have layouts of their own, and so do the controls over the picture (landscape) and beside it (portrait on an iPad, an iPhone Duo half folded). Positions are kept as fractions of the screen, so a layout follows the screen it is shown on. The editor is not offered in **Tap** or while a controller is connected (the touch controls are hidden then).
 
 In portrait (an iPad, an iPhone Duo's inner screen) the picture sits above the controls; so it does on a Duo half folded, the picture on the upper half. An iPad game also runs in a window of any size (Stage Manager).
 

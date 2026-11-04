@@ -12,6 +12,7 @@ targets:
       - path: ../../Sources/GameMenu.swift
       - path: ../../Sources/LauncherSettings.swift
       - path: ../../Sources/DmGamepad.m
+      - path: ../../Sources/DmPadEditor.m
       - path: ../../Sources/front_ios.m
     dependencies:
       - sdk: UIKit.framework
