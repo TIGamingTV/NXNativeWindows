@@ -1,0 +1,27 @@
+# The Windows build path (win/) on Windows: its unit tests, including the subprocess shim's (win/pyshim/sitecustomize.py), which the Mac and Linux runs skip. No toolchain,
+# SDK or game files: win/compile_check.py needs the iPhoneOS SDK from Xcode.xip, which CI does not have.
+name: windows
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  win-tests:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: The Python packages the pipeline imports
+        run: python -m pip install lz4 "capstone>=5,<6" fonttools pillow zbic backports.zstd
+      - name: Windows port tests (win/tests/test_win.py)
+        run: python win/tests/test_win.py
+      - name: The documentation's links and tables
+        run: |
+          python dm/tools/tests/test_docs.py
+          python dm/tools/tests/test_env_switches.py

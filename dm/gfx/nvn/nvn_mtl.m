@@ -360,6 +360,7 @@ static int disc_on(void) {
 // for 15 s in a row. A game whose logic counts frames runs slower while capped, which beats being closed
 static _Atomic int g_mem_level;
 static int g_mem_flushes;
+#if TARGET_OS_IPHONE   // os_proc_available_memory is iOS's: a Mac has no per-app limit, and dm_mem_guard answers 0 there
 static void mem_flush(const char *why, size_t left) {
     g_disc_on = 1;   // texture memory saver on for the rest of the run (disc_on)
     size_t freed = malloc_zone_pressure_relief(NULL, 0);
@@ -384,6 +385,7 @@ static void mem_sample(int event) {
     }
 }
 static int mem_guard_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_MEM_GUARD"); on = !(e && !strcmp(e, "0")); MLOG("memory guard: %s (DM_MEM_GUARD)", on ? "on: frame rate 30 under 600 MB left, caches flushed under 300 MB" : "off"); } return on; }
+#endif
 int dm_mem_guard(void) {
 #if TARGET_OS_IPHONE
     static dispatch_once_t once;
