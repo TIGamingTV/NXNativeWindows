@@ -66,6 +66,19 @@ class Startup(unittest.TestCase):
             self.assertEqual(locate(), str(folder))
             image.pack(source, doc / 'romfs.img'); self.assertEqual(locate(), str(doc / 'romfs.img'))
 
+    def test_split_build_image_in_its_data_folder(self):
+        # win/build_app.py: a split build whose extraction is one image puts it in its data folder as romfs.img; the folder is copied into Documents whole
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); doc = root / 'Documents'; data = doc / 'Game-data'; (data / 'msl').mkdir(parents=True)
+            tmp = root / 'temp'; tmp.mkdir(); bundle = root / 'App'; bundle.mkdir()
+            source = root / 'source'; source.mkdir(); (source / 'marker').write_text('resource')
+            def locate():
+                return subprocess.run([str(self.locator), str(doc), str(tmp), str(bundle)], capture_output=True, text=True)
+            (data / 'romfs.img').write_bytes(b'cut off')   # an incomplete copy: not used
+            self.assertEqual(locate().returncode, 1)
+            image.pack(source, data / 'romfs.img')
+            result = locate(); self.assertEqual(result.returncode, 0, result.stderr); self.assertEqual(result.stdout.strip(), str(data / 'romfs.img'))
+
     def test_slim_build_uses_only_the_image_it_was_built_for(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); doc = root / 'Documents'; doc.mkdir()

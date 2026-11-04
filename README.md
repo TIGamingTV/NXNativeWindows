@@ -332,14 +332,14 @@ Only `--platform ios` builds on Windows. `--prepare-xcode` and the Mac platforms
 A normal IPA carries the game files, so signing and installing a 3 GB game takes minutes, every 7 days with a free Apple ID. A split build keeps them apart:
 
 - `<Game>.ipa`: only the app (Balatro: 10 MB). Sideloadly signs and installs it in seconds.
-- `<Game>-data\`: `romfs\`, `msl\` (the shader libraries) and `aoc\` (DLC), hard-linked from the build, so it takes no extra disk space. Its `README.txt` repeats these steps.
+- `<Game>-data\`: the game files (`romfs.img`, one RomFS image, as the build extracts them; `romfs\` from an older extraction), `msl\` (the shader libraries) and `aoc\` (DLC), hard-linked from the build, so it takes no extra disk space. Its `README.txt` repeats these steps.
 
 Install the IPA, open the app once (it says the game files are missing), then copy the whole `<Game>-data` folder into the app's Documents:
 
 - **Windows**: the *Apple Devices* app (or iTunes) → your device → *Files* → the app → drag the folder in.
 - **On the device**: the *Files* app → *On My iPhone/iPad* → the app, from a USB drive, a network share or iCloud Drive.
 
-Close the app fully and open it again. The app looks for `romfs` in Documents and in every folder directly inside it, so the folder can keep its name. Re-signing the IPA later leaves Documents alone. Copy the data folder again only after a new build of the same game (`nxw_data.tsv` in it names the build). Shaders from one build do not load in an app from another chain version: the log says so.
+Close the app fully and open it again. The app looks for `romfs.img` (or `romfs`) in Documents and in every folder directly inside it, so the folder can keep its name. Re-signing the IPA later leaves Documents alone. Copy the data folder again only after a new build of the same game (`nxw_data.tsv` in it names the build). Shaders from one build do not load in an app from another chain version: the log says so.
 
 ## Install the IPA on your iPhone or iPad
 
