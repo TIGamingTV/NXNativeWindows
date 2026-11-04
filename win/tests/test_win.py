@@ -43,6 +43,19 @@ class Shim(unittest.TestCase):
         self.assertIn("dmsh_xlate.dll', '--source-sha']", r.stderr)
         self.assertIn("build_app.py', 'out.ipa']", r.stderr)
 
+    @unittest.skipUnless(os.name == 'nt', 'the shim is active on Windows only')
+    def test_dump_folder_pack(self):   # scripts/pack_dump.py's ExeFS copy (cp -c) and dm/tools/romfs_image.py's guest names (xattr): a Switch 2 game folder
+        with tempfile.TemporaryDirectory() as t:
+            src = Path(t) / 'base'; (src / 'exefs').mkdir(parents=True); (src / 'romfs/.dm-case-1').mkdir(parents=True)
+            (src / 'exefs/main').write_bytes(b'x' * 100); (src / 'romfs/.dm-case-1/a.bin').write_bytes(b'y')
+            r = self.run_mapped(f'import sys; sys.path[:0] = [{str(REPO / "scripts")!r}, {str(REPO / "dm/tools")!r}]\n'
+                                'import pack_dump, romfs_image\nfrom pathlib import Path\n'
+                                f'pack_dump.exefs(Path({str(src / "exefs")!r}), Path({str(Path(t) / "ExeFS")!r}))\n'
+                                f'print("guest", romfs_image.guest({str(src / "romfs")!r}, ".dm-case-1"))')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual((Path(t) / 'ExeFS/main').read_bytes(), b'x' * 100)
+            self.assertIn('guest .dm-case-1', r.stdout)
+
 
 class HostSources(unittest.TestCase):
     def test_matches_makefile(self):
