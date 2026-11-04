@@ -166,7 +166,13 @@ def link(clang, sdk, objs, fws, embed_flags, out):
     rt = compat_rt_needed(clang)
     if rt: args.append(str(rt))
     t(f'link: {len(objs)} objects, {len(fws)} frameworks (ld64.lld)')
-    r = subprocess.run(args, capture_output=True, text=True)
+    # The arguments go in a response file (clang @file): a game's objects and embed flags make a command line longer than Windows' 32,767 characters (WinError 206 on Mario Kart
+    # World's 268 objects). Quoted as clang reads the file on the host: Windows' command-line rules there (clang's default --rsp-quoting on Windows), its GNU rules on Linux
+    # (each argument in double quotes, \\ and \" escaped)
+    rsp = Path(out).parents[2] / 'link.rsp'   # beside Payload/, outside the app (the IPA packs DmIOS.app)
+    gnu = lambda a: '"' + a.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    rsp.write_text(subprocess.list2cmdline(args[1:]) if os.name == 'nt' else ' '.join(map(gnu, args[1:])), encoding='utf-8')
+    r = subprocess.run([args[0], f'@{rsp}'], capture_output=True, text=True)
     if r.returncode: print(r.stderr[-6000:], file=sys.stderr); die('link failed')
 
 
