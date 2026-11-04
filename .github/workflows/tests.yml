@@ -221,6 +221,9 @@ jobs:
       - name: Install the selected Xcode's Metal toolchain
         run: xcodebuild -downloadComponent MetalToolchain
       - name: Toolchain (Xcode and the Metal compiler of dmsh_chain.lock)
+        # This Windows port's lock records the Metal Developer Tools for Windows (README.md, Updating from upstream), which no Mac runner has: the Mac build check runs with Xcode's
+        env:
+          DM_ALLOW_OTHER_METAL: '1'
         run: |
           xcodebuild -version
           xcrun metal --version

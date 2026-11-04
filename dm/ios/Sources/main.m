@@ -95,15 +95,6 @@ static NSString *romfs_locate(NSString *prog) {   // prog: a game of several pro
     return nil;
 }
 int nxw_data_found(void) { return romfs_locate(nil) != nil; }   // win/ios/DataHelp.m's "Check again"
-// <data root>/<name> when it exists and is not empty (a split build's msl/ and aoc/), else <App>/<name>
-static NSString *data_dir(NSString *name) {
-    NSString *res = NSBundle.mainBundle.resourcePath;
-    if (g_data_root && ![g_data_root isEqualToString:res]) {
-        NSString *p = [g_data_root stringByAppendingPathComponent:name];
-        if ([[NSFileManager.defaultManager contentsOfDirectoryAtPath:p error:nil] count]) return p;
-    }
-    return [res stringByAppendingPathComponent:name];
-}
 
 // Add-on content (DLC): each DLC's RomFS image at <dir>/<index>.img (or a legacy <index>/ folder). Like the game files, Documents/aoc comes before <App>/aoc.
 // A DM_AOC_DIR that is already set (env.txt, the launch environment) wins. The host mounts and counts the DLC from DM_AOC_DIR (hle_fs.c, hle_misc.c)
@@ -111,7 +102,7 @@ static void aoc_locate(void) {
     if (getenv("DM_AOC_DIR")) return;
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
-    for (NSString *d in @[[doc stringByAppendingPathComponent:@"aoc"], data_dir(@"aoc")]) {   // data_dir: a split build's <data root>/aoc, else <App>/aoc
+    for (NSString *d in @[[doc stringByAppendingPathComponent:@"aoc"], [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"aoc"]]) {
         BOOL dir = NO;
         if (![fm fileExistsAtPath:d isDirectory:&dir] || !dir) continue;
         setenv("DM_AOC_DIR", d.fileSystemRepresentation, 0);
@@ -140,6 +131,15 @@ static void romfs_identity_report(NSString *doc) {
     fprintf(stderr, "[RED] boot: %s\n", g_boot_message);
 }
 
+// <data root>/<name> when it exists and is not empty (a split build's msl/ and aoc/), else <App>/<name>
+static NSString *data_dir(NSString *name) {
+    NSString *res = NSBundle.mainBundle.resourcePath;
+    if (g_data_root && ![g_data_root isEqualToString:res]) {
+        NSString *p = [g_data_root stringByAppendingPathComponent:name];
+        if ([[NSFileManager.defaultManager contentsOfDirectoryAtPath:p error:nil] count]) return p;
+    }
+    return [res stringByAppendingPathComponent:name];
+}
 static NSString *program_env(void);
 static int boot_env(void) {
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -195,6 +195,10 @@ static int boot_env(void) {
     setenv("DM_SAVE", [doc stringByAppendingPathComponent:@"save"].fileSystemRepresentation, 0);
     setenv("DM_TEMP", [doc stringByAppendingPathComponent:@"temp"].fileSystemRepresentation, 0);
     setenv("DM_FONT_DIR", [[res stringByAppendingPathComponent:@"dm"] stringByAppendingPathComponent:@"font"].fileSystemRepresentation, 0);   // Shared-font stand-ins (standard.ttf / nintendo_ext.ttf): iOS lacks the macOS font path
+    {   // a split build's DLC sits in its data folder (<data root>/aoc), which Documents/aoc and <App>/aoc do not name: aoc_locate keeps a DM_AOC_DIR already set
+        NSString *split = data_dir(@"aoc");
+        if (!getenv("DM_AOC_DIR") && ![fm fileExistsAtPath:[doc stringByAppendingPathComponent:@"aoc"]] && [split hasPrefix:doc]) setenv("DM_AOC_DIR", split.fileSystemRepresentation, 0);
+    }
     aoc_locate();   // add-on content: Documents/aoc, else <App>/aoc; an empty Documents/aoc explicitly selects no DLC
     NSString *pso = [res stringByAppendingPathComponent:@"pso"];   // the pipeline archive made offline (build_ipa.sh, dm/gfx/tools/pso_offline.py): the shader pairs' bases, which the device then does not build
     if ([fm fileExistsAtPath:pso]) setenv("DM_PSO_BUNDLE", pso.fileSystemRepresentation, 0);

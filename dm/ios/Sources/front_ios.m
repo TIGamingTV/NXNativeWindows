@@ -123,7 +123,7 @@ static void launcher_done(void) { [g_root startGame]; }
     front_ios_power_watch();
     front_ios_notify_setup();
     if (!front_ios_boot_ok()) {   // No game files: show a hint and do not start the host
-        void nxw_show_data_help(UIViewController *root);   // win/ios/DataHelp.m: where a split build's data folder goes, step by step
+        void nxw_show_data_help(UIViewController *root);   // win/ios/DataHelp.m: where a split build's data folder goes, step by step (a weak default below for an Xcode build)
         nxw_show_data_help(self); return;
     }
     front_ios_audio_watch();
@@ -226,6 +226,11 @@ static void launcher_done(void) { [g_root startGame]; }
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
 @end
+// The Windows build links win/ios/DataHelp.m, whose nxw_show_data_help shows a split build's steps. An Xcode build does not compile it: this weak default shows upstream's hint
+__attribute__((weak)) void nxw_show_data_help(UIViewController *root) {
+    const char *why = front_ios_boot_message();
+    [(DmRootVC *)root showHint:why ? [NSString stringWithFormat:@"Game files unusable.\n%s", why] : @"Game files not found.\nPut the RomFS folder into this App's Documents as \"romfs\" (Files app), then restart."];
+}
 UIViewController *front_ios_root(void) { return [DmRootVC new]; }
 
 // A TV (cable or AirPlay): iOS gives the app the TV as a scene of its own instead of mirroring the phone. The game's view moves there, 16:9 fills the TV, and the game is

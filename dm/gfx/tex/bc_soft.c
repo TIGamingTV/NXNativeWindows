@@ -104,7 +104,7 @@ static void bc7_block(const uint8_t *p, uint8_t *out, size_t pitch) {
     const bc7_mode *m = &M7[mode];
     bits_t b; bits_init(&b, p); bits_get(&b, mode + 1);
     int part = (int)bits_get(&b, m->pb), rot = (int)bits_get(&b, m->rb), isel = (int)bits_get(&b, m->isb);
-    int ep[6][4];   // endpoints, RGBA
+    int ep[6][4] = {{0}};   // endpoints, RGBA (zeroed: a subset's pair is always read whole)
     int ne = m->ns * 2;
     for (int c = 0; c < 3; c++) for (int e = 0; e < ne; e++) ep[e][c] = (int)bits_get(&b, m->cb);
     for (int e = 0; e < ne; e++) ep[e][3] = m->ab ? (int)bits_get(&b, m->ab) : 255;
@@ -119,7 +119,7 @@ static void bc7_block(const uint8_t *p, uint8_t *out, size_t pitch) {
         v <<= 8 - bits; v |= v >> bits;
         ep[e][c] = v;
     }
-    int i1[16], i2[16];
+    int i1[16] = {0}, i2[16] = {0};
     for (int i = 0; i < 16; i++) i1[i] = (int)bits_get(&b, m->ib - is_anchor(m->ns, part, i));
     if (m->ib2) for (int i = 0; i < 16; i++) i2[i] = (int)bits_get(&b, m->ib2 - (i == 0));
     for (int i = 0; i < 16; i++) {
@@ -205,7 +205,7 @@ static void bc6_block(const uint8_t *p, uint8_t *out, size_t pitch, int sgn) {
         if (f->rev) { uint32_t r = 0; for (int k = 0; k < f->n; k++) r |= (x >> k & 1) << (f->n - 1 - k); x = r; }
         v[f->f] |= (int)(x << f->lo);
     }
-    int part = v[D], ne = m->ns * 2, e[4][3];   // endpoints: 0,1 = subset 0 (w, x), 2,3 = subset 1 (y, z)
+    int part = v[D], ne = m->ns * 2, e[4][3] = {{0}};   // endpoints: 0,1 = subset 0 (w, x), 2,3 = subset 1 (y, z)
     static const int map[4][3] = {{RW, GW, BW}, {RX, GX, BX}, {RY, GY, BY}, {RZ, GZ, BZ}};
     const int db[3] = {m->dr, m->dg, m->db};
     for (int k = 0; k < ne; k++) for (int c = 0; c < 3; c++) e[k][c] = v[map[k][c]];
