@@ -40,6 +40,10 @@ def main():
     # every Python the pipeline starts loads the shim; this one too
     os.environ['PYTHONPATH'] = os.pathsep.join([str(SHIM)] + [p for p in os.environ.get('PYTHONPATH', '').split(os.pathsep) if p])
     os.environ.setdefault('PYTHONUTF8', '1')   # the pipeline reads and writes UTF-8 text without naming the encoding
+    # dm/tools/patch_nso.py in_parallel runs its x18 and spin wait scans in a 'fork' pool, with SIGTERM held by signal.pthread_sigmask: Windows has neither (a platform limit,
+    # AttributeError: module 'signal' has no attribute 'pthread_sigmask'). One worker per module takes in_parallel's sequential path; the modules are still rewritten
+    # side by side, one process each (build_ipa_from_nsp.py rewrite), so the cores stay busy on a game of several modules
+    if os.name == 'nt': os.environ['DM_REWRITE_J'] = '1'
     os.environ.setdefault('J', str(max(8, 2 * (os.cpu_count() or 4))))   # dmsh_build.py's workers (upstream 8): on Windows each shader compile is mostly metal.exe starting up, so twice the cores keep the CPU busy
     # Windows builds get their own bundle IDs (org.nxnativewindows.<title ID>), so they install beside a Mac-built IPA of the same game; --bundle-id still names any ID
     if not any(a == '--bundle-id' or a.startswith('--bundle-id=') for a in sys.argv):
