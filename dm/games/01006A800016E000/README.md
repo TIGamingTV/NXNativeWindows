@@ -7,7 +7,7 @@ Update 13.0.5 (`v2031616`) over the base game, with its 99 DLC licences; SDK 8.2
 | Setting | Where | Why |
 |---|---|---|
 | Engine region 62 GB → 4 GB (11 instructions) | [`patches.py`](patches.py), `main` `21450c64…`; for other builds the same cuts as one function-matched patch of four functions (`MATCH_CUTS`) | the game aborts in its static initialisers when its 62 GB address region fails; see [Memory](#memory) |
-| Node area 1 GB → 62 MB, regions of 1 GB and more aligned to 32 MB | `dm/tools/sdk_patches.py`, `sdk` build `5fd4f531…` (`sdk+0x336b50` / `+0x336bf0`, `+0x336d5c`) | with them the cut region starts 64 MB into the alias region instead of 1.95 GB |
+| Node area 1 GB → 62 MB, regions of 4 MB and more aligned to 2 MB (SDK 20's) | `dm/tools/sdk_patches.py` SDK-wide rules, `sdk` build `5fd4f531…` (`sdk+0x336b50` / `+0x336bf0`, `+0x336d54` / `+0x336d5c` / `+0x336d60`) | with them the cut region starts 64 MB into the alias region instead of 1.95 GB |
 | 5 GB guest layout: `mem_reserve 0x140000000`, `mem_alias 0x118000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | [`game.tsv`](game.tsv) | a 4.375 GB alias region, where the game maps its memory itself |
 | `sys_resource 0x1000000` | `game.tsv` | the NPDM declares 16 MB of system resource (virtual address memory); `main` never sets a heap |
 | NRO modules | `dm/tools/nro_collect.py` (`nro.tsv`), `loader.c` "NRO modules", `hle_ro.c`, `gen_embed.py` | the fighter, item and common scripts; see [Fighter code at run time](#fighter-code-at-run-time) |
@@ -35,6 +35,7 @@ No `pad_layout` key (the iPhone pad starts in the 3D layout).
 
 - **Resolved: a jump to pc=0 right after the NVN bootstrap loader** (`lr=main+0x37fe930`, `[RED] NVN address lookup of an unknown name: nvnSetExternalDebuggerEnabledNVX`). The game fetches an NVX extension of the SDK 8 driver by name and calls it without checking the pointer. The real driver has it, so it joins `dm/gfx/nvn/names.txt` as a no-op (thunks regenerated with `gen_protos.py`; no prototype in `nvn.h`, so `NVN_NOPROTO`).
 - **Resolved: only 64 of the 99 DLC licences were reported** (PR #441). Challenger Packs 1-4 and 11 (indices 2-5 and 12: Joker, Hero, Banjo & Kazooie, Terry and Sora), plus costume and spirit packs, were among the omissions. The contributor rebuilt the Mac app and confirmed all 99 indices in its startup log; the general fix is linked below. Integration also checked the actual 99 DLC folders with the host's count/list hooks under ASan/UBSan: the baseline returned 64, the candidate all 99 in order, including paginated queries. **Open:** DLC fighter availability in character select and an iOS rebuild with this fix have not been verified.
+- **Resolved: an abort when the single-player mode starts** (`[RED] sf: the game connects to service caps:su itself`, then `caps:u`; `Break#1 Result=0xe15` from `sm`, ResultNotRegistered). The game links the capture services' clients (`caps:su`, `caps:u`) into its own `main` and connects to them through `sm` while the single-player mode runs. They are now host sessions that answer every request with success and zeroed output (`sf_served` in `hle_sf.c`, as for `olsc:u`), so screenshots and clips are silently not saved and the game goes on. `caps:a`, `caps:c`, `caps:sc` and `caps:ss` are listed with them but were not seen in the logs. Found on the Mac app of 13.0.5 (`v2031616`), several battles in a row played without another abort.
 
 ## Rendering
 
@@ -55,7 +56,10 @@ No `pad_layout` key (the iPhone pad starts in the 3D layout).
 
 General host changes first needed here; each applies to every game:
 
+- **Elapsed time between two snapshots read as unknown** (the Spirit Board, reported by MacNativeGames): [Hooks whose return type did not match the SDK](../../../docs/reference/services.md#hooks-whose-return-type-did-not-match-the-sdk).
 - **The complete owned DLC list:** [Owned add-on content lists beyond 64 entries](../../../docs/reference/services.md#owned-add-on-content-lists-beyond-64-entries).
+- **Movie crackle:** [Vorbis output lengths at a window change](../../../docs/reference/movies.md#vorbis-output-lengths-at-a-window-change). Of about 7,300 packets in the first movie, some 420 were affected; `DM_AUDIO_DUMP` had 124 and 287 silent 512-sample blocks in the two opening movies before the fix and none after.
+- **The opening movie's sound ended at its first Flush:** [Vorbis sound stops for good after a Flush](../../../docs/reference/movies.md#vorbis-sound-stops-for-good-after-a-flush).
 - **NRO modules loaded at run time:** collected by the NRRs' SHA-256s (`nro_collect.py`, `nro.tsv`), rewritten (`patch_nso.py` reads NROs), mapped at start and activated by `nn::ro::LoadModule` / `UnloadModule` (`loader.c` "NRO modules", `hle_ro.c`; `DM_NRO=0` turns it off), embedded on iOS (`gen_embed.py`, `nro_pieces`): [Loading NROs with `ro::LoadModule`](../../../docs/reference/services.md#loading-nros-with-roloadmodule), [development.md, The packing script in detail](../../../docs/development.md#the-packing-script-in-detail).
 - **Register copies followed back to a jump table's base** (`copied_base`): [Far table base passed through other registers](../../../docs/reference/rewriter.md#far-table-base-passed-through-other-registers).
 - **`nvnSetExternalDebuggerEnabledNVX`** as a no-op (`names.txt`, `NVN_NOPROTO`): [Extensions fetched by name and called unchecked](../../../docs/reference/nvn-objects.md#extensions-fetched-by-name-and-called-unchecked).

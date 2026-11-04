@@ -115,7 +115,7 @@ def main():
                 try: sp.loader.exec_module(mm)
                 except Exception: continue
                 for k, v in getattr(mm, 'CUTS', {}).items(): registered.setdefault(k, list(v))
-            cuts = mods.cuts_for(pfiles, exe_dir, g.get('modules').split(), registered, log=up.say)
+            cuts = mods.cuts_for(pfiles, exe_dir, g.modules_in(exe_dir) if hasattr(g, 'modules_in') else g.get('modules').split(), registered, log=up.say)
             if cuts:
                 mf.parent.mkdir(parents=True, exist_ok=True)
                 mf.write_text(json.dumps({'extend': {k: v for k, v in cuts.items() if k in registered}, 'new': {k: v for k, v in cuts.items() if k not in registered}}, indent=1), encoding='utf-8')
@@ -215,8 +215,22 @@ def main():
             up.PROG.end(f'{len(got)} shaders from {c}')
             return dst
         # no capture yet: pack the capture IPA
-        envf = work / 'tmp' / 'capture_env.txt'; envf.parent.mkdir(parents=True, exist_ok=True)
-        envf.write_text(f'# shader capture (win/build_ipa_windows.py): the host saves every shader the game compiles at run time into Documents/{name}\n{var}={name}\n', encoding='utf-8')
+        out, gname, stem = pack_capture_ipa(name, var, gfx, d, patched, work, env, g)
+        want_n = f'{len(want)} ' if want else ''
+        raise BuildError(f'this game compiles {want_n}shaders only at run time; they are captured on your device, as upstream captures them on a Mac. 1) Install {out} '
+                         f'(Sideloadly){split_step(out)} and play it until its title screen, then wait a minute (no picture is fine: it has no shaders yet). 2) In the Files app, copy '
+                         f'"On My iPhone/iPad › {gname or stem} (capture) › {name}" to {nsp}. 3) Build again: the build finds the folder and makes the real IPA')
+
+    def split_step(out):
+        sp = os.environ.get('NXW_SPLIT_DATA', '')
+        return (f', open it once, copy the folder {out.with_name(out.stem + "-data")} into its Documents (Apple Devices app › Files, or the Files app; '
+                f'the app shows the steps), reopen it') if sp and sp != '0' else ''
+
+    def pack_capture_ipa(name, var, gfx, d, patched, work, env, g, what='shader capture', saves='every shader the game compiles at run time'):
+        """A capture IPA: no shader libraries, var=name in its dm/env.txt, so the host writes what is captured into Documents/<name> (the launcher makes the folder)"""
+        nsp = work.parent
+        envf = work / 'tmp' / f'{name}_env.txt'; envf.parent.mkdir(parents=True, exist_ok=True)
+        envf.write_text(f'# {what} (win/build_ipa_windows.py): the host saves {saves} into Documents/{name}\n{var}={name}\n', encoding='utf-8')
         stem = (g.get('ipa') or f'{g.id}.ipa').rsplit('.', 1)[0]
         out = nsp / f'{stem}-capture.ipa'
         nacp = d / 'control.nacp'
@@ -225,15 +239,41 @@ def main():
         cenv = dict(env, GAME=g.id, W=str(work / 'ipa_capture'), PATCHED=str(patched), ROMFS=str(up.rfs.source(d)), AOC='', GFXAPI=gfx, DM_ENV_FILE=str(envf), NXW_CAPTURE_IPA='1',
                     DM_DISPLAY_NAME=f'{gname or stem} (capture)', DM_SHOW_FPS='NO')
         up.PROG.set(step='packing the capture IPA')
-        up.run([sys.executable, str(WIN / 'build_app.py'), str(out)], logs_dir(work) / 'capture_ipa.log', env=cenv)
+        up.run([sys.executable, str(WIN / 'build_app.py'), str(out)], logs_dir(work) / f'{name}_ipa.log', env=cenv)
         up.PROG.end(ok=False)
-        want_n = f'{len(want)} ' if want else ''
-        sp = os.environ.get('NXW_SPLIT_DATA', '')
-        data_step = (f', open it once, copy the folder {out.with_name(out.stem + "-data")} into its Documents (Apple Devices app › Files, or the Files app; '
-                     f'the app shows the steps), reopen it') if sp and sp != '0' else ''
-        raise BuildError(f'this game compiles {want_n}shaders only at run time; they are captured on your device, as upstream captures them on a Mac. 1) Install {out} '
-                         f'(Sideloadly){data_step} and play it until its title screen, then wait a minute (no picture is fine: it has no shaders yet). 2) In the Files app, copy '
-                         f'"On My iPhone/iPad › {gname or stem} (capture) › {name}" to {nsp}. 3) Build again: the build finds the folder and makes the real IPA')
+        return out, gname, stem
+
+    # A game whose code is an NRO it decodes at run time (Mario Tennis Fever, a Switch 2 game: main is a boot stub that unpacks a 24.7 MB NRO from its data segment). Upstream boots
+    # the rewritten boot stub in the Mac host with DM_NRO_CAPTURE, which writes the decoded image at its LoadModule (dm/host/hle_ro.c) and ends the run. Here the iPhone runs the same
+    # boot natively: a capture IPA of the rewritten modules with DM_NRO_CAPTURE=nro_capture, run once (it closes itself about a second after the start), and the folder it wrote in
+    # Documents, copied next to the game files, finishes the rewrite. The NRR's SHA-256 checks the image (missing.tsv names the hashes it registers)
+    def capture_nro(py, repo, exe_dir, out, nro_dir, env, logs, g, provisional):
+        missing = nro_dir / 'missing.tsv'
+        if not missing.is_file(): return g
+        want = dict(l.split('\t') for l in missing.read_text().splitlines() if l)
+        if not want: return g
+        up.PROG.add(2); up.PROG.stage('NRO capture (from the device)')
+        work = out.parent; nsp = work.parent; d = exe_dir.parent
+        roots = [nsp] + ([nsp.parent] if nsp.name.endswith('_nxw') else [])
+        got = None
+        for c in [r / n for r in roots for n in ('nro_capture', f'{g.id}_capture/nro_capture', f'{g.id}_capture')]:
+            hits = [f for f in sorted(c.glob('*.nro')) if f.stem in want] if c.is_dir() else []
+            if hits: got = hits[0]; break
+            if c.is_dir() and any(c.glob('*.nro')): up.say(f'[RED] {c} holds NROs, but none the game registers ({", ".join(list(want)[:2])}…): run the capture IPA of this version again')
+        if not got:
+            o, gname, stem = pack_capture_ipa('nro_capture', 'DM_NRO_CAPTURE', 'nvn', d, out, work, env, g, 'NRO capture', 'the code module the game decodes at run time')
+            raise BuildError(f'this game decodes its code at run time ({len(want)} NRO(s) its NRR registers, which no file holds); it is captured on your device, as upstream captures it on '
+                             f'a Mac. 1) Install {o} (Sideloadly){split_step(o)} and open it, then press Play: it closes itself within seconds (that is the capture). 2) In the Files app, copy '
+                             f'"On My iPhone/iPad › {gname or stem} (capture) › nro_capture" to {nsp}. 3) Build again: the build finds the folder and makes the real IPA')
+        sha = got.stem; manifest = nro_dir / 'nro.tsv'
+        rows = [l for l in manifest.read_text().splitlines() if l]
+        nm = f'nro{sum(1 for l in rows if not l.startswith(("#", "refused")))}'
+        shutil.copy2(got, nro_dir / f'{nm}.nro')
+        manifest.write_text('\n'.join(rows + [f'{nm}\t{sha}\t{(nro_dir / f"{nm}.nro").stat().st_size}\t{want.pop(sha)}\tcapture']) + '\n')
+        missing.write_text(''.join(f'{h}\t{n}\n' for h, n in want.items()))
+        up.PROG.end(f'{nm} from {got}, {(nro_dir / f"{nm}.nro").stat().st_size / 2**20:.1f} MB')
+        return up.rewrite(py, repo, exe_dir, out, env, logs, g, provisional)
+    up.capture_nro = capture_nro
 
     def logs_dir(work): return work / 'logs'
 

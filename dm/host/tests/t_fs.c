@@ -5,16 +5,28 @@
 //   (3) transaction: the failure in (1) causes this transaction's Commit to be rejected and the working directory to return to the committed version; the next transaction writes in the working directory, the committed directory is still the old version before Commit and the new version after Commit;
 //   (4) DM_TEST_FS_FAIL=write:N:errno makes only the Nth save write fail, with writes before and after proceeding normally; that transaction's Commit is rejected, the committed version is unchanged, and the front end receives one notification;
 //      the next transaction commits normally, and the final save = the content of the next transaction;
-//   (5) remounting discards uncommitted content.
+//   (5) remounting discards uncommitted content;
+//   (8) a save folder that cannot clone (ENOTSUP: HFS+, exFAT) mounts read-only and tells the front end; recursive deletes unlink symlinks and never empty their targets.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <sys/clonefile.h>                // declared before the define, so only hle_fs.c's calls go to the fake
 static ssize_t fake_pwrite(int fd, const void *buf, size_t n, off_t off);
+static int fake_clonefile(const char *src, const char *dst, uint32_t flags);
 #define pwrite fake_pwrite
+#define clonefile fake_clonefile
 #include "../hle_fs.c"
 #undef pwrite
+#undef clonefile
 ssize_t pwrite(int, const void *, size_t, off_t);
+static int g_clone_enotsup;                   // 1: clonefile fails as on HFS+ and exFAT (ENOTSUP), checked on disk images of both
+static int fake_clonefile(const char *src, const char *dst, uint32_t flags) {
+    if (g_clone_enotsup) { errno = ENOTSUP; return -1; }
+    return clonefile(src, dst, flags);
+}
 
 struct dm_flags g_flag; uint64_t g_t0_ns; uint64_t now_ns(void) { return 0; }   // stubs for log timestamps and the read path (not used by the write path)
 void dm_guest_write_prepare(void *a, size_t n) { (void)a; (void)n; }
@@ -40,6 +52,17 @@ static Result write_save(const char *path, const char *s) {           // open ->
 }
 static int read_fs(const char *path, char *out, size_t n) { uint64_t h; size_t got = 0; if (h_fs_OpenFile(&h, path, MODE_READ)) return 0; Result r = h_fs_ReadFile(&got, h, 0, out, n - 1); h_fs_CloseFile(h); out[got] = 0; return !r; }
 
+// A stand-in for the SDK's own mount table: one RAM disk, and what the host asks of it (Unmount of an SDK-owned mount, GitHub issue #1012)
+extern void *(*t_guest_sym)(const char *);
+static int g_sdk_cache_mounted, g_sdk_asked, g_sdk_unmounts, g_sdk_no_is_mounted;
+static int sdk_is_mounted(const char *name) { g_sdk_asked++; return g_sdk_cache_mounted && !strcmp(name, "cache"); }
+static void sdk_unmount(const char *name) { g_sdk_unmounts++; if (!g_sdk_cache_mounted || strcmp(name, "cache")) abort(); g_sdk_cache_mounted = 0; }   // as the SDK's: not mounted aborts
+static void *sdk_sym(const char *name) {
+    if (!strcmp(name, "_ZN2nn2fs9IsMountedEPKc")) return g_sdk_no_is_mounted ? NULL : (void *)sdk_is_mounted;
+    if (!strcmp(name, "_ZN2nn2fs7UnmountEPKc")) return (void *)sdk_unmount;
+    return NULL;
+}
+
 int main(void) {
     char root[1024], save[1100], work[1200], p[1200];
     const char *sp = getenv("TMPDIR"); snprintf(root, sizeof root, "%s/t_fs.XXXXXX", sp ? sp : "/private/tmp");
@@ -49,11 +72,26 @@ int main(void) {
     mkdir(rom, 0755); mkdir(overlay, 0755); mkdir(rdata, 0755); mkdir(odata, 0755);
     snprintf(fn, sizeof fn, "%s/same", rdata); put(fn, "base"); snprintf(fn, sizeof fn, "%s/same", odata); put(fn, "overlay"); snprintf(fn, sizeof fn, "%s/base", rdata); put(fn, "only-base"); snprintf(fn, sizeof fn, "%s/over", odata); put(fn, "only-overlay");
     setenv("DM_ROMFS", rom, 1); setenv("DM_ROMFS_OVERLAY", overlay, 1); CHECK(h_fs_MountRom("rom", NULL, 0) == RES_OK, "mount RomFS with two layers (base + overlay)");
+    size_t rom_cache = 0; CHECK(h_fs_QueryRomCacheIdx(&rom_cache, 0) == RES_OK && rom_cache == 0x1000, "SDK 19: the cache size overload with a program index");
+    CHECK(h_fs_MountRomIdx("rom2", 0, NULL, 0) == RES_OK && read_fs("rom2:/data/base", got, sizeof got) && !strcmp(got, "only-base"), "SDK 19: MountRom with a program index mounts the RomFS");
     CHECK(read_fs("rom:/data/same", got, sizeof got) && !strcmp(got, "overlay"), "the overlay file wins"); CHECK(read_fs("rom:/data/base", got, sizeof got) && !strcmp(got, "only-base"), "falls back to the base when the overlay lacks the file");
     uint64_t rh; CHECK(h_fs_OpenFile(&rh, "rom:/data/same", MODE_WRITE) == RES_FAIL, "the two-layer mount refuses writes");
     CHECK(read_fs("rom:\\data\\over", got, sizeof got) && !strcmp(got, "only-overlay") && read_fs("rom:\\data\\base", got, sizeof got) && !strcmp(got, "only-base"), "backslashes separate as slashes do, in both layers");
     CHECK(h_fs_OpenFile(&rh, "rom:/data/base", MODE_READ) == RES_OK && rh && !(rh & 15), "a folder file's handle is 16-byte aligned, as a Horizon FileAccessor pointer is (%#llx)", (unsigned long long)rh); h_fs_CloseFile(rh);
     g_nmnt = 0;
+    unsetenv("DM_ROMFS_OVERLAY");
+    {   // game files that are neither a folder nor a file (a stale path, a fifo) stop the rom mount with a FATAL line, in a child so the abort does not end this test
+        char gone[1200], fifo[1200], out[1200]; snprintf(gone, sizeof gone, "%s/RomFS", root); snprintf(fifo, sizeof fifo, "%s/fifo", root); snprintf(out, sizeof out, "%s/fatal.txt", root);
+        mkfifo(fifo, 0644);
+        const char *paths[2] = {gone, fifo};
+        for (int i = 0; i < 2; i++) {
+            fflush(NULL); pid_t pid = fork();
+            if (!pid) { freopen(out, "w", stderr); setenv("DM_ROMFS", paths[i], 1); h_fs_MountRom("rom", NULL, 0); _exit(0); }
+            int st = 0; waitpid(pid, &st, 0);
+            char line[512] = {0}; FILE *f = fopen(out, "r"); if (f) { fread(line, 1, sizeof line - 1, f); fclose(f); }
+            CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT && strstr(line, "FATAL the game files") && strstr(line, paths[i]), "%s game files stop the rom mount", i ? "a fifo as the" : "missing");
+        }
+    }
 
     printf("RomFS image\n");   // written by hand in romfs_image.py's layout: /data/a = "hello", /data/b empty directory, /data/c = "xy"
     {   uint8_t img[32 + 7 + 5 * 24 + 7] = {0}; uint64_t hd[3] = {39, 5 * 24 + 7, 5};
@@ -64,7 +102,12 @@ int main(void) {
         CHECK(read_fs("rom:/data/a", got, sizeof got) && !strcmp(got, "hello"), "reads a file"); CHECK(read_fs("rom:/data/../data/c", got, sizeof got) && !strcmp(got, "xy"), "reads the next file, through ..");
         uint64_t h; size_t n = 0; int64_t sz = 0; char b[16] = {0};
         CHECK(h_fs_OpenFile(&h, "rom:/data/a", MODE_READ) == RES_OK && h_fs_ReadFile(&n, h, 3, b, 10) == RES_OK && n == 2 && !memcmp(b, "lo", 2), "a read stops at the end of the file (got %zu)", n);
-        CHECK(h_fs_GetFileSize(&sz, h) == RES_OK && sz == 5 && h_fs_GetFileOpenMode(h) == MODE_READ, "size 5, open for reading"); h_fs_CloseFile(h);
+        CHECK(h_fs_GetFileSize(&sz, h) == RES_OK && sz == 5 && h_fs_GetFileOpenMode(h) == MODE_READ, "size 5, open for reading");
+        // the overloads without a bytes-read output must read in full: a short read is a failure, with or without read options
+        { const uint32_t opt = 0; memset(b, 0, sizeof b);
+          CHECK(h_fs_ReadFileExact(h, 1, b, 4) == RES_OK && !memcmp(b, "ello", 4) && h_fs_ReadFileExactOpt(h, 0, b, 5, &opt) == RES_OK && !memcmp(b, "hello", 5), "full reads without a byte count succeed");
+          CHECK(h_fs_ReadFileExact(h, 3, b, 10) != RES_OK && h_fs_ReadFileExactOpt(h, 3, b, 10, &opt) != RES_OK, "short reads without a byte count fail"); }
+        h_fs_CloseFile(h);
         // entry 4: its index has low bits set, which Metroid Prime 4's file device masks off (handle & ~7) as it may of a Horizon pointer
         CHECK(h_fs_OpenFile(&h, "rom:/data/c", MODE_READ) == RES_OK && !(h & 15) && h_fs_ReadFile(&n, h & ~7ull, 0, b, 10) == RES_OK && n == 2 && !memcmp(b, "xy", 2), "entry 4 still reads after its handle's low bits are masked off (%#llx)", (unsigned long long)h);
         CHECK(h_fs_GetFileSize(&sz, h & ~7ull) == RES_OK && sz == 2, "and is 2 bytes"); h_fs_CloseFile(h & ~7ull);
@@ -96,6 +139,22 @@ int main(void) {
         CHECK(h_fs_QueryAocCache(&cache, 2) == RES_OK && cache == 176, "DLC image reports Horizon table size (176, got %zu)", cache);
         CHECK(h_fs_MountAoc("aoc", 2, NULL, 0) == RES_OK && read_fs("aoc:/data/a", got, sizeof got) && !strcmp(got, "hello"), "DLC mounts and reads directly from its image");
         unsetenv("DM_AOC_DIR"); g_nmnt = 0;
+        {   // a file written as read from a damaged NSP (nx_extract --allow-damaged) still reads, and the mount counts it and the first open names it once
+            romfs_img *clean = img_open(ip); CHECK(clean && !clean->damaged, "a clean image has no damaged files"); romfs_image_close(clean);
+            e[2].flags = IMG_ENT_DAMAGED; memcpy(img + 39, e, sizeof e);
+            f = fopen(ip, "wb"); fwrite(img, 1, sizeof img, f); fclose(f);
+            CHECK(h_fs_MountRom("rom", NULL, 0) == RES_OK && g_mnt[0].img && g_mnt[0].img->damaged == 1, "a damaged file mounts, and is counted");
+            CHECK(g_mnt[0].img->e[2].flags == IMG_ENT_DAMAGED, "not named before its first open");
+            CHECK(read_fs("rom:/data/c", got, sizeof got) && !strcmp(got, "xy") && g_mnt[0].img->e[4].flags == 0, "opening a clean file names nothing");
+            CHECK(read_fs("rom:/data/a", got, sizeof got) && !strcmp(got, "hello") && g_mnt[0].img->e[2].flags == (IMG_ENT_DAMAGED | IMG_ENT_REPORTED), "the damaged file reads as written, and is named");
+            CHECK(read_fs("rom:/data/a", got, sizeof got) && !strcmp(got, "hello"), "and reads again");
+            g_nmnt = 0;
+            e[2].flags = 2; memcpy(img + 39, e, sizeof e); f = fopen(ip, "wb"); fwrite(img, 1, sizeof img, f); fclose(f);
+            CHECK(!img_open(ip), "an unknown flag on a file is refused");
+            e[2].flags = 0; e[1].flags = IMG_ENT_DAMAGED; memcpy(img + 39, e, sizeof e); f = fopen(ip, "wb"); fwrite(img, 1, sizeof img, f); fclose(f);
+            CHECK(!img_open(ip), "a damaged flag on a directory is refused");
+            e[1].flags = 0; memcpy(img + 39, e, sizeof e);
+        }
         f = fopen(ip, "wb"); fwrite(img, 1, 39 + 50, f); fclose(f);   // cut off inside the index, as a copy stopped partway
         CHECK(!img_open(ip), "a cut-off image is refused");
     }
@@ -191,6 +250,43 @@ int main(void) {
         h = 0; CHECK(h_fs_OpenDirectory(&h, "save:\\dir", DIRMODE_FILE) == RES_OK && h_fs_ReadDirectory(&cnt, de, h, 4) == RES_OK && cnt == 1 && !strcmp(de[0].name, "g"), "the directory lists g, not a name with backslashes (%s)", cnt ? de[0].name : "-"); h_fs_CloseDirectory(h);
     }
 
+    printf("⑧ a save folder that cannot clone, and symlinks in recursive deletes\n");
+    {   g_nmnt = 0; g_clone_enotsup = 1; int nf1 = g_nfail;
+        CHECK(h_fs_MountSave("save", NULL) == RES_OK && g_mnt[0].ro && g_nfail == nf1 + 1, "clonefile ENOTSUP: the committed save mounts read-only and the front end is told once");
+        CHECK(read_fs("save:/a", got, sizeof got) && !strcmp(got, "ok3"), "the committed save still reads (a = %s)", got);
+        CHECK(write_save("save:/a", "lost") != RES_OK, "a write is refused");
+        snprintf(p, sizeof p, "%s/a", save); CHECK(same(p, "ok3"), "committed a is still ok3");
+        g_clone_enotsup = 0; g_nmnt = 0;
+        CHECK(h_fs_MountSave("save", NULL) == RES_OK && !g_mnt[0].ro, "with cloning back, the save mounts writable");
+        char victim[1100], vf[1200], lnk[1200];
+        snprintf(victim, sizeof victim, "%s/victim", root); mkdir(victim, 0755); snprintf(vf, sizeof vf, "%s/keep", victim); put(vf, "keep");
+        CHECK(h_fs_CreateDirectory("save:/d") == RES_OK, "create save:/d");
+        snprintf(lnk, sizeof lnk, "%s/d/lnk", work); CHECK(symlink(victim, lnk) == 0, "a symlink to a directory outside the save inside save:/d");
+        CHECK(h_fs_DeleteDirRec("save:/d") == RES_OK && access(lnk, F_OK) && same(vf, "keep"), "DeleteDirectoryRecursively removes the symlink, not its target's files");
+        CHECK(h_fs_CreateDirectory("save:/d") == RES_OK && symlink(victim, lnk) == 0, "the same again in a new save:/d");
+        CHECK(h_fs_CleanDirRec("save:/d") == RES_OK && access(lnk, F_OK) && same(vf, "keep"), "CleanDirectoryRecursively removes the symlink, not its target's files");
+        snprintf(lnk, sizeof lnk, "%s/lnk2", root); symlink(victim, lnk); errno = 0;
+        CHECK(rm_tree(lnk) == -1 && errno == ENOTDIR && same(vf, "keep"), "rm_tree of a symlink to a directory refuses it (ENOTDIR) and leaves the target alone");
+    }
+
+    {   // Unmount follows who holds the mount: the host's table is permanent, the SDK's entry is released in the SDK, so the name can be mounted again
+        CHECK(h_fs_IsMounted("save"), "the host holds save");
+        h_fs_Unmount("cache"); CHECK(1, "Unmount with no SDK in the process is a no-op");
+        t_guest_sym = sdk_sym; g_sdk_cache_mounted = 1;
+        h_fs_Unmount("save");
+        CHECK(!g_sdk_asked && !g_sdk_unmounts && h_fs_IsMounted("save"), "a host mount stays and the SDK is not asked");
+        h_fs_Unmount("nowhere");
+        CHECK(g_sdk_asked == 1 && !g_sdk_unmounts, "a name in neither table is a no-op (the SDK's Unmount would abort on it)");
+        h_fs_Unmount(NULL);
+        CHECK(g_sdk_asked == 1 && !g_sdk_unmounts, "a null name reaches no SDK call");
+        h_fs_Unmount("cache");
+        CHECK(g_sdk_unmounts == 1 && !g_sdk_cache_mounted, "an SDK-owned mount is released in the SDK");
+        h_fs_Unmount("cache");
+        CHECK(g_sdk_unmounts == 1, "unmounting it again does not reach the SDK's Unmount");
+        g_sdk_cache_mounted = 1; g_sdk_no_is_mounted = 1; h_fs_Unmount("cache");
+        CHECK(g_sdk_unmounts == 1 && g_sdk_cache_mounted, "an SDK without an IsMounted symbol: no blind Unmount");
+        t_guest_sym = NULL;
+    }
 
     char cmd[1200]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", root); system(cmd);
     printf("== %d checks, %d failed ==\n", checks, fails);

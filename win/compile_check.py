@@ -13,7 +13,9 @@ work = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(tempfile.gettempdir()) /
 sdk = tc.ios_sdk() or ba.die('no iPhoneOS SDK'); clang = tc.llvm_tool('clang') or ba.die('no clang')
 (work / 'profile').mkdir(parents=True, exist_ok=True)
 ba.py(ba.DM / 'games/game.py', 'header', game, work / 'profile/game_profile.h')
-files, incs = ba.host_sources(work / 'profile')
-files += [p.resolve() for p in sorted((ba.IOS / 'Sources').glob('*.m'))] + [(WIN / 'ios/Launcher.m').resolve(), (WIN / 'ios/DataHelp.m').resolve(), (WIN / 'ios/nxw_unzip.c').resolve()]
+files, incs = ba.host_sources(work / 'profile', ba.host_msl(work / 'msl-iphoneos'))
+files += [p.resolve() for p in sorted((ba.IOS / 'Sources').glob('*.m'))] + [(WIN / f'ios/{n}').resolve() for n in ba.WIN_IOS_SOURCES]
 objs = ba.compile_all(clang, sdk, files, incs, work / 'obj', [])
+dav1d, dav1d_incs = ba.dav1d_sources()
+objs += ba.compile_all(clang, sdk, dav1d, dav1d_incs, work / 'obj-dav1d', ba.DAV1D_FLAGS)
 print(f'compile_check: {len(objs)} files compiled for {game} ({sdk.name} {" ".join(tc.sdk_settings(sdk))})')

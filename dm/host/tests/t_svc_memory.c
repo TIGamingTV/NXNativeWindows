@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 static int memory_mprotect(void *addr, size_t size, int prot);
+static void *memory_mmap(void *addr, size_t size, int prot, int flags, int fd, off_t offset);
 static _Noreturn void memory_abort(void);
 static int memory_getpagesize(void) {
 #ifdef TEST_PAGE_16K
@@ -21,10 +22,12 @@ static int memory_getpagesize(void) {
 }
 #define getpagesize memory_getpagesize
 #define mprotect memory_mprotect
+#define mmap memory_mmap
 #define abort memory_abort
 #include "../hle_svc.c"
 #undef abort
 #undef mprotect
+#undef mmap
 #undef getpagesize
 
 static module_t test_modules[2];
@@ -36,6 +39,7 @@ int svc_thread(int num, uint64_t *regs) { (void)num; (void)regs; return 0; }
 void dm_backtrace(uint64_t fp) { (void)fp; }
 void guest_clock_read_wait(void) {}
 uint64_t guest_ns(void) { return 0; }
+uint64_t guest_ticks(void) { return 0; }
 uint64_t dm_entropy64(void) { return 0; }
 int thr_limit_used(void) { return 0; }
 int dm_ue_heap_owns(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; } // No Unreal allocator is installed in this fixture.
@@ -76,7 +80,7 @@ void dm_guest_write_prepare(void *addr, size_t size) {
     }
 }
 
-static int fail_protect;
+static int fail_protect, fail_mmap;
 static uint64_t *failure_regs, failure_input[3];
 static int64_t failure_mapped;
 static size_t failure_heap;
@@ -88,6 +92,10 @@ static int memory_mprotect(void *addr, size_t size, int prot) {
     atomic_fetch_add(&protects, 1);
     if (fail_protect) { errno = EACCES; return -1; }
     return mprotect(addr, size, prot);
+}
+static void *memory_mmap(void *addr, size_t size, int prot, int flags, int fd, off_t offset) {
+    if (fail_mmap) { errno = ENOMEM; return MAP_FAILED; }
+    return mmap(addr, size, prot, flags, fd, offset);
 }
 static _Noreturn void memory_abort(void) {
     // Only the production fatal path reaches this wrapper; assertion failures
@@ -131,7 +139,9 @@ static void fatal(unsigned svc, uint64_t x0, uint64_t x1, uint64_t x2) {
         uint64_t r[31] = {x0, x1, x2}; failure_regs = r;
         memcpy(failure_input, r, sizeof failure_input);
         failure_mapped = g_alias_mapped; failure_heap = g_heap_cur;
-        failure_nmap = g_nmap; failure_prepares = prepares; fail_protect = 1;
+        // Releases first replace the mapping, then fall back to mprotect. Both
+        // must fail to exercise the fatal path without publishing metadata.
+        failure_nmap = g_nmap; failure_prepares = prepares; fail_protect = fail_mmap = 1;
         svc_dispatch(svc, r, 0); _exit(79);
     }
     int status; assert(waitpid(pid, &status, 0) == pid);
@@ -243,6 +253,29 @@ static void module_sources(void) {
     assert(svc_nro_deactivate(&g_mod[0]) && !g_mod[0].loaded);
     assert(map(stack, (uintptr_t)b + 0x4000, P) == BAD);
     g_nmod = 0; memset(g_mod, 0, sizeof test_modules); assert(!munmap(b, 0x20000));
+}
+
+// A module with the patch area before the base and a second one after the image (patch_nso.py TWO, EA SPORTS FC 27's 185.6 MB of text): data and bss end at the back area,
+// which is reported as CodeData+RX and is no mapping source, like a patch area after the image
+static void module_back_patch(void) {
+    uint8_t *a = mmap(NULL, 0x30000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0), *b = a + 0x8000;
+    assert(a != MAP_FAILED);
+    g_mod[0] = (module_t){.base=b, .size=0x28000, .text_end=0x2800, .ro_off=0x2800, .data_off=0x3000, .patch_off=-0x8000, .patch_len=0x4000, .image_size=0x28000,
+        .file_image_len=0x4000, .key_page_off=0x10000, .key_page_size=0x4000, .back_off=0x20000, .back_len=0x8000, .loaded=1};
+    g_nmod = 1;
+    assert(!mprotect(b, 0x4000, PROT_READ));
+    assert(!mprotect(b + 0x10000, 0x4000, PROT_READ));
+    assert(!mprotect(b + 0x20000, 0x8000, PROT_READ));
+    expect((uintptr_t)b - 0x8000, (uintptr_t)b - 0x8000, 0x4000, 4, 0, 5);
+    expect((uintptr_t)b + 0x4000, (uintptr_t)b + 0x4000, 0xc000, 4, 0, 3);
+    expect((uintptr_t)b + 0x14000, (uintptr_t)b + 0x14000, 0xc000, 4, 0, 3);
+    expect((uintptr_t)b + 0x20000, (uintptr_t)b + 0x20000, 0x8000, 4, 0, 5);
+    expect((uintptr_t)b + 0x27000, (uintptr_t)b + 0x20000, 0x8000, 4, 0, 5);
+    assert(map(stack, (uintptr_t)b + 0x1f000, 2 * P) == BAD);
+    assert(map(stack, (uintptr_t)b + 0x20000, P) == BAD);
+    assert(!map(stack, (uintptr_t)b + 0x14000, P));
+    assert(!unmap(stack, (uintptr_t)b + 0x14000, P));
+    g_nmod = 0; memset(g_mod, 0, sizeof test_modules); assert(!munmap(a, 0x30000));
 }
 
 // Apple has no pthread_barrier. The gate makes races deterministic at entry,
@@ -409,6 +442,24 @@ static void failures(void) {
     fatal(1, 0, 0x200000, 0);
     assert(!resize(0x200000)); fatal(1, 0, 0, 0); assert(!resize(0));
 }
+static void release_fallback(void) {
+    size_t pg = memory_getpagesize();
+    assert(!pages(1, alias, pg));
+    memset((void *)alias, 0x53, pg);
+    fail_mmap = 1;
+    assert(!pages(0, alias, pg));
+    assert(!g_alias_mapped);
+    expect(alias, (uintptr_t)g_as, heap - (uintptr_t)g_as, 0, 0, 0);
+    fail_mmap = 0;
+    // The fallback retained the old backing: recommit must still clear it.
+    assert(!pages(1, alias, pg));
+    for (size_t i = 0; i < pg; ++i) assert(((uint8_t *)alias)[i] == 0);
+    assert(!pages(0, alias, pg));
+    assert(!resize(0x200000));
+    fail_mmap = 1;
+    assert(!resize(0) && !g_heap_cur);
+    fail_mmap = 0;
+}
 // Exercise the real host helper through SDK-shaped test entry points. Its stack
 // allocation must reach MapMemory as guest backing and outlive SDK copyback.
 #include "../hle_guestthread.c"
@@ -465,7 +516,7 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < 8; ++i) assert(!pthread_create(&threads[i], NULL, init_worker, &addresses[i]));
     for (unsigned i = 0; i < 8; ++i) { assert(!pthread_join(threads[i], NULL)); assert(addresses[i] == addresses[0]); }
     alias = addresses[0]; stack = info(I_StackAddr); heap = info(I_HeapAddr);
-    lazy_commit(); alias_lifecycle(); ownership(); module_sources(); failures(); concurrency(); fragmented_queries();
+    lazy_commit(); alias_lifecycle(); ownership(); module_sources(); module_back_patch(); failures(); release_fallback(); concurrency(); fragmented_queries();
     guest_helper();
     if (!DM_GAME_MEM_MAP_LIMIT) metadata_limit();
 #ifdef TEST_REAL_DIRTY
@@ -479,6 +530,9 @@ int main(int argc, char **argv) {
     g_mod[1] = (module_t){.size=0x160000000, .file_image_len=0x100000, .patch_off=-0x2000000, .nro=1};
     assert(info(I_UsedMem) == DM_GAME_MEM_USED + 0xff00000);
     assert(info(I_UsedNonSys) == DM_GAME_MEM_USED + 0xff00000);
+    g_mod[0].back_len = 0x40000;   // a back patch area (patch_nso.py TWO) is code from the file, not bss
+    assert(info(I_UsedMem) == DM_GAME_MEM_USED + 0xfec0000);
+    g_mod[0].back_len = 0;
     assert(image_bytes() == 0x10000000);
     g_nmod = 0;
     free(g_alias_bits); free(g_alias_exposed); assert(!munmap(g_as, RESERVE));

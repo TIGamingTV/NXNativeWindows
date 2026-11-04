@@ -2,7 +2,7 @@
 // Newer SDKs link the renderer server side (nn::audio::server: InfoUpdater / CommandGenerator ...) and the CPU version of the DSP command processing (nn::audio::dsp::CommandListProcessor:
 // ADPCM / PCM decoding, resampling, mixing, reverb / delay / biquad / limiter / compressor ...) into the application, for the "CPU rendering + manual execution" mode (AudioRendererParameter
 // +0x2c renderingDevice = 1 CPU, +0x30 executionMode = 1 manual). In this mode OpenAudioRenderer goes through the in-process DFC manager (CreateAudioRendererManagerByDfc),
-// RequestUpdate is parsed in-process, and rendering happens on the CPU of whichever thread calls nn::audio::ExecuteAudioRendererRendering, which then signals the game's renderer event.
+// RequestUpdate is parsed in-process, and rendering happens on the CPU of whichever thread calls nn::audio::ExecuteAudioRendererRendering, which then signals the renderer event (the renderer's own: ar_open).
 // The host does three things:
 //   1. Takes over GetAudioRendererWorkBufferSize / OpenAudioRenderer: preserves the DSP service's work-buffer requirement, then runs the SDK's CPU + manual renderer.
 //      The local SDK uses a different command format whose storage can exceed the service's budget; that backend storage is supplied by the host. Explicit CPU renderers keep the SDK contract;
@@ -130,6 +130,28 @@ static void render_main(void *arg) {
 // hook below since that form has one (Balatro): the inner call started the render thread before the event form had created its event, and the outer call then logged a second
 // renderer. The inner call (t_in_open) goes straight to the SDK with the host's copy of the parameter, as it did before the form without an event was hooked
 static __thread int t_in_open;
+// The renderer's own event (the write end the service keeps on Horizon). Every SDK's DSP open keeps no pointer to the game's SystemEventType: it stores NULL in the handle's event
+// slot (SDK 3 sdk+0x17e004, SDK 12 sdk+0x4d2b4: handle[1]; SDK 18: *handle[1]) and attaches the service's readable handle to the game's object. The CPU + manual open the host
+// substitutes stores the object in that slot instead (SDK 3 sdk+0x17dffc, SDK 12 sdk+0x4d274), and ExecuteAudioRendererRendering signals it after every render, so the game's
+// object had to outlive the renderer, which Horizon never asks of it. LEGO Star Wars: The Skywalker Saga (SDK 12) passes one on its stack, Little Nightmares (SDK 3) reuses its
+// memory, and the render thread's first SignalSystemEvent aborted on a state byte (+0x28) that was no longer the event's. The SDK now gets one of these, alive until Close
+static struct { void *obj; uint8_t ev[0x80] __attribute__((aligned(16))); } g_rev[4];   // obj: the renderer (handle[0]) it belongs to, NULL when free
+static pthread_mutex_t g_rev_mu = PTHREAD_MUTEX_INITIALIZER;
+static void *rev_take(void) {
+    pthread_mutex_lock(&g_rev_mu); void *ev = NULL;
+    for (int i = 0; i < 4 && !ev; i++) if (!g_rev[i].obj) { g_rev[i].obj = (void *)1; memset(g_rev[i].ev, 0, sizeof g_rev[i].ev); ev = g_rev[i].ev; }
+    pthread_mutex_unlock(&g_rev_mu); return ev;
+}
+static void rev_set(void *ev, void *obj) {   // obj NULL frees the slot
+    pthread_mutex_lock(&g_rev_mu);
+    for (int i = 0; i < 4; i++) if (g_rev[i].ev == ev) g_rev[i].obj = obj;
+    pthread_mutex_unlock(&g_rev_mu);
+}
+static void *rev_find(void *obj) {
+    pthread_mutex_lock(&g_rev_mu); void *ev = NULL;
+    for (int i = 0; i < 4 && !ev; i++) if (g_rev[i].obj == obj) ev = g_rev[i].ev;
+    pthread_mutex_unlock(&g_rev_mu); return ev;
+}
 static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work, size_t sz) {
     static Result (*orig_ev)(void **, void *, const uint8_t *, void *, size_t), (*orig)(void **, const uint8_t *, void *, size_t);
     if (!orig_ev) orig_ev = gsym("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm");
@@ -153,17 +175,28 @@ static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work,
             LOG("audren: host backs local renderer work buffer %p+%#zx", work, sz);
         }
     }
-    t_in_open = 1; Result r = ev ? orig_ev(handle, ev, p, work, sz) : orig(handle, p, work, sz); t_in_open = 0;
-    if (r) { free(owned); LOG("[RED] audren: SDK OpenAudioRenderer failed %#x", r); return r; }
+    // A game that opens a CPU renderer itself gets the SDK's contract: the SDK keeps its event, as on Horizon. The nested open (t_in_open) gets the outer open's event
+    void *sev = ev && *(int32_t *)(param + P_DEVICE) == 0 ? rev_take() : NULL;
+    if (ev && *(int32_t *)(param + P_DEVICE) == 0 && !sev) LOG("[RED] audren: all renderer events in use: the SDK keeps the game's event, which must then outlive the renderer");
+    t_in_open = 1; Result r = ev ? orig_ev(handle, sev ? sev : ev, p, work, sz) : orig(handle, p, work, sz); t_in_open = 0;
+    if (r) { free(owned); rev_set(sev, NULL); LOG("[RED] audren: SDK OpenAudioRenderer failed %#x", r); return r; }
     if (owned) objmap_put(handle[0], owned);   // Close releases it only after the render thread and the SDK have finished with it
     // The renderer event as the service gives it. With the DSP service (device 0, what the game asked for) OpenAudioRenderer attaches the service's kernel event (auto-clear,
     // AttachReadableHandleToSystemEvent); with CPU + manual it creates a local one instead (CreateSystemEvent(ev, AutoClear, false), SDK 4: sdk+0x190b6c). A signal of a local
     // auto-clear event wakes only its highest-priority waiter, a kernel event wakes every waiter (each tries ResetSignal). Donkey Kong Country: Tropical Freeze waits on it from
     // two threads: its audio thread (priority 29) every frame, and the main thread while CAudioMemoryPool::Shutdown detaches a pool as a level loads (main+0x6fa8c); the audio
-    // thread took every wake and the main thread waited forever. The renderer signals the event through os::SignalSystemEvent, which takes either kind
+    // thread took every wake and the main thread waited forever. So the renderer's own event becomes a kernel event (auto-clear), and the game's object gets a copy of its
+    // readable handle, managed by the game as the service's copied handle is: the game may destroy or reuse its object at any time, and the renderer never touches it again
     if (ev && *(int32_t *)(param + P_DEVICE) == 0) {
         static void (*destroy)(void *); if (!destroy) destroy = gsym("_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE");
-        destroy(ev); hle_bind_system_event(ev, 1);
+        if (sev) {
+            static void (*attach)(void *, uint32_t, int, int); static uint32_t (*getr)(const void *);
+            if (!attach) { attach = gsym("_ZN2nn2os33AttachReadableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE");
+                           getr = gsym("_ZN2nn2os30GetReadableHandleOfSystemEventEPKNS0_15SystemEventTypeE"); }
+            destroy(sev); hle_bind_system_event(sev, 1);
+            attach(ev, hle_dup_readable_handle(getr(sev)), 1, 1);   // managed (the game's DestroySystemEvent closes its copy), EventClearMode_AutoClear
+            rev_set(sev, handle[0]);
+        } else { destroy(ev); hle_bind_system_event(ev, 1); }   // no free renderer event: the earlier behaviour, which needs the game's object to live
     }
     if (atomic_load(&g_open)) { LOG("[RED] audren: a second renderer (the host drives only one)"); return r; }
     g_handle[0] = handle[0]; g_handle[1] = handle[1]; atomic_store(&g_open, 1);
@@ -179,9 +212,13 @@ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "close 
     // Join the render thread first (it checks g_open every round and at most every 10 ms while waiting for the output): it may be inside exec(), which uses the renderer the SDK is about to free.
     // A fixed 20 ms sleep used to stand in for this, and a renderer reopened inside that window ran a second thread over the first one's static buffers
     if (obj == g_handle[0] && g_render_tt) { atomic_store(&g_open, 0); dm_guest_thread_join(g_render_tt); g_render_tt = NULL; }
-    void *owned = objmap_del(obj);
+    void *owned = objmap_del(obj), *sev = rev_find(obj);
     orig(obj, state);
     free(owned);
+    if (sev) {   // the SDK's Close does not touch the event (SDK 3 to 18); destroying it closes the renderer's ends, and the game's copied read end stays the game's
+        static void (*destroy)(void *); if (!destroy) destroy = gsym("_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE");
+        destroy(sev); rev_set(sev, NULL);
+    }
 }
 
 // DeviceSink input mix buffers → int16 stereo. The command ID is 0x13 in SDK 16; SDK 20 inserted a command before it, making it 0x14 (written at sdk+0x233f44); SDK 8 (Link's Awakening)
@@ -196,7 +233,10 @@ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "close 
 //   indices. Walked as SDK 20, the first command's enabled / ID / size bytes read as a magic of 0x181901 and the game was silent. With no magic, that walk must stay inside the generated list
 // SDK 4.4.0 (Mario Kart 8 Deluxe, GenerateDeviceSinkCommand at sdk+0x19e690) has the SDK 6 header, and its DeviceSink is ID 0xf and 0x130 bytes: +0x14 device name, +0x118 upsample buffer,
 //   +0x120 input count, +0x124 input indices as bytes (s8). No 0x148-byte command, so the first full command list's one 0x130-byte command with 1 to 6 inputs is the sink (g_sink4)
-static int g_sink_id = 0x13, g_hdr6, g_hdr21, g_sink4;
+// SDK 5.4.0 (Bastion, GenerateDeviceSinkCommand at sdk+0x233890) has the SDK 6 header and SDK 4's DeviceSink (ID 0xf, the same offsets), but 0x138 bytes with the input indices as s16
+//   (g_sink5). Its first list holds two commands, the first of ID 0x14 and 0x14 bytes, so it walks in the SDK 8–20 layout too (ID read as size): a list that walks in more than one
+//   layout decides nothing either
+static int g_sink_id = 0x13, g_hdr6, g_hdr21, g_sink4, g_sink5;
 // Probing the wrong layout can advance by an unaligned size: decode wire fields without typed loads.
 static int cmd_size(const uint8_t *q) { int16_t n; memcpy(&n, q + (g_hdr21 ? 2 : g_hdr6 ? 4 : 6), sizeof n); return n; }
 static int cmd_id(const uint8_t *q) { int16_t id; if (g_hdr21) return q[1]; if (g_hdr6) { memcpy(&id, q + 6, sizeof id); return id; } return q[5]; }
@@ -254,38 +294,57 @@ static int capture(const uint8_t *cl, size_t len, int16_t *dst) {
     uint32_t ncmd = *(const uint32_t *)(cl + 4), samples = *(const uint32_t *)(cl + 0x14), rate = *(const uint32_t *)(cl + 0x18);
     const int32_t *mix = *(const int32_t *const *)(cl + 8); const uint8_t *cend = cl + len;
     static int logged, hist_logged, layout_done;
-    if (!layout_done && ncmd) {   // the header layout, from the first list that walks in one (SDK 21's first lists have 4 commands or fewer, which the old layout would report as malformed)
+    if (!layout_done && ncmd) {   // the header layout, from the first list that walks in exactly one (SDK 21's first lists have 4 commands or fewer, which the old layout would report as malformed)
         // A list generated before the game's first update need not walk in any layout: Mario Kart 8 Deluxe's (SDK 4.4.0) first list, made by the render thread before the first
         // RequestUpdate, ends in a zeroed command (first word 0). Taken as the layout, it left the SDK 6 headers read in the newer layout and the game silent; such a list is skipped
-        if (cmd_walks(cl, ncmd, cend)) layout_done = 1;
-        else { g_hdr6 = 1; if (cmd_walks(cl, ncmd, cend)) { layout_done = 1; g_sink_id = 0x10; LOG("audren: command headers in the SDK 6 layout (+4 size, +6 command ID, +0x10 enabled), DeviceSink is ID 0x10"); } else g_hdr6 = 0; }
-        if (!layout_done) { g_hdr21 = 1; if (cmd_walks(cl, ncmd, cend)) { layout_done = 1; LOG("audren: command headers in the SDK 21 layout (no magic: +0 enabled, +1 command ID, +2 size), DeviceSink 0x140 bytes"); } else g_hdr21 = 0; }
-        if (!layout_done) { static int skipped; if (!skipped++) LOG("audren: command list %u commands long walks in no header layout (generated before the first update?): silent frame, the layout is taken from a later list", ncmd); return 0; }
+        int w16 = cmd_walks(cl, ncmd, cend), w6, w21;
+        g_hdr6 = 1; w6 = cmd_walks(cl, ncmd, cend); g_hdr6 = 0;
+        g_hdr21 = 1; w21 = cmd_walks(cl, ncmd, cend); g_hdr21 = 0;
+        if (w16 + w6 + w21 == 1) {
+            layout_done = 1;
+            if (w6) { g_hdr6 = 1; g_sink_id = 0x10; LOG("audren: command headers in the SDK 6 layout (+4 size, +6 command ID, +0x10 enabled), DeviceSink is ID 0x10"); }
+            if (w21) { g_hdr21 = 1; LOG("audren: command headers in the SDK 21 layout (no magic: +0 enabled, +1 command ID, +2 size), DeviceSink 0x140 bytes"); }
+        } else {
+            static int skipped; if (!skipped++) LOG("audren: command list %u commands long walks in %s header layout (generated before the first update?): silent frame, the layout is taken from a later list", ncmd, w16 + w6 + w21 ? "more than one" : "no");
+            return 0;
+        }
     }
     if (!layout_done) return 0;
-    if (!hist_logged && ncmd > 4) {   // first full command list: command ID histogram and the sink ID check
-        hist_logged = 1;
-        int hist[64] = {0}, cand = -1, ncand = 0, cand4 = -1, ncand4 = 0, sink_sz = 0x148 + sink_body(); const uint8_t *q = cl + 0x20; char line[512]; size_t o = 0;
-        for (uint32_t i = 0; i < ncmd && cmd_ok(q, cend); i++) {
-            int sz = cmd_size(q); hist[cmd_id(q) & 63]++;
-            if (sz == sink_sz && *(const uint32_t *)(q + 0x130 + sink_body()) - 1 < 6) { cand = cmd_id(q); ncand++; }
-            if (g_hdr6 && sz == 0x130 && *(const uint32_t *)(q + 0x120) - 1 < 6) { cand4 = cmd_id(q); ncand4++; }
-            q += sz;
-        }
-        for (int k = 0; k < 64; k++) if (hist[k]) o += snprintf(line + o, sizeof line - o, " %d×%d", k, hist[k]);
-        LOG("audren: first-frame commands %u, by command ID: %s", ncmd, line);
-        if (!hist[g_sink_id & 63] && ncand == 1) { LOG("audren: no command with ID %#x in the command list; the only 0x148-byte command is ID %#x, taking it as DeviceSink", g_sink_id, cand); g_sink_id = cand; }
-        else if (!hist[g_sink_id & 63] && !ncand && ncand4 == 1) { LOG("audren: no command with ID %#x in the command list; the only 0x130-byte command is ID %#x, taking it as the SDK 4 DeviceSink", g_sink_id, cand4); g_sink_id = cand4; g_sink4 = 1; }
-        else if (!hist[g_sink_id & 63]) LOG("[RED] audren: no DeviceSink (ID %#x) in the command list, %d commands of %#x bytes: the game will have no sound", g_sink_id, ncand, sink_sz);
-    }
+    // A later list can be incomplete too. Validate every command before consuming the
+    // one-time sink scan or returning PCM from a sink that precedes a malformed tail.
     const uint8_t *c = cl + 0x20;
     for (uint32_t i = 0; i < ncmd; i++) {
         if (!cmd_ok(c, cend)) { if (!logged++) LOG("[RED] audren: command %u in the command list is malformed (offset %#zx, list %#zx bytes)", i, (size_t)(c - cl), len); return 0; }
+        c += cmd_size(c);
+    }
+    if (!hist_logged && ncmd > 4) {   // first full command list: command ID histogram and the sink ID check
+        hist_logged = 1;
+        int hist[64] = {0}, cand = -1, ncand = 0, cand4 = -1, ncand4 = 0, sink_sz = 0x148 + sink_body(); const uint8_t *q = cl + 0x20; char line[512] = {0}; size_t o = 0;
+        for (uint32_t i = 0; i < ncmd; i++) {
+            int sz = cmd_size(q); hist[cmd_id(q) & 63]++;
+            if (sz == sink_sz && *(const uint32_t *)(q + 0x130 + sink_body()) - 1 < 6) { cand = cmd_id(q); ncand++; }
+            if (g_hdr6 && (sz == 0x130 || sz == 0x138) && *(const uint32_t *)(q + 0x120) - 1 < 6) { cand4 = cmd_id(q); ncand4++; g_sink5 = sz == 0x138; }
+            q += sz;
+        }
+        for (int k = 0; k < 64; k++) if (hist[k]) {
+            int n = snprintf(line + o, sizeof line - o, " %d×%d", k, hist[k]);
+            // snprintf returns the untruncated length: keep only complete entries and
+            // never advance the next write past the available buffer.
+            if (n < 0 || (size_t)n >= sizeof line - o) { line[o] = 0; break; }
+            o += (size_t)n;
+        }
+        LOG("audren: first-frame commands %u, by command ID: %s", ncmd, line);
+        if (!hist[g_sink_id & 63] && ncand == 1) { LOG("audren: no command with ID %#x in the command list; the only 0x148-byte command is ID %#x, taking it as DeviceSink", g_sink_id, cand); g_sink_id = cand; }
+        else if (!hist[g_sink_id & 63] && !ncand && ncand4 == 1) { LOG("audren: no command with ID %#x in the command list; the only %#x-byte command is ID %#x, taking it as the SDK %d DeviceSink", g_sink_id, g_sink5 ? 0x138 : 0x130, cand4, g_sink5 ? 5 : 4); g_sink_id = cand4; g_sink4 = 1; }
+        else if (!hist[g_sink_id & 63]) LOG("[RED] audren: no DeviceSink (ID %#x) in the command list, %d commands of %#x bytes: the game will have no sound", g_sink_id, ncand, sink_sz);
+    }
+    c = cl + 0x20;
+    for (uint32_t i = 0; i < ncmd; i++) {
         int size = cmd_size(c);
         if (cmd_id(c) == g_sink_id && cmd_on(c)) {
             const uint8_t *b = c + sink_body();
             uint32_t nin = *(const uint32_t *)(b + (g_sink4 ? 0x120 : 0x130)); int16_t in[6];
-            for (uint32_t j = 0; j < 6; j++) in[j] = g_sink4 ? ((const int8_t *)(b + 0x124))[j] : ((const int16_t *)(b + 0x134))[j];
+            for (uint32_t j = 0; j < 6; j++) in[j] = g_sink4 && !g_sink5 ? ((const int8_t *)(b + 0x124))[j] : ((const int16_t *)(b + (g_sink4 ? 0x124 : 0x134)))[j];
             const int32_t *up = *(const int32_t *const *)(b + (g_sink4 ? 0x118 : 0x128));
             if (!logged++) LOG("audren: DeviceSink inputs %u (%d %d …) rate %u samples per frame %u mix buffer %p upsample buffer %p%s", nin, nin ? in[0] : -1, nin > 1 ? in[1] : -1, rate, samples, (void *)mix, (void *)up,
                                rate == 32000 ? " (32 kHz: resampled to 48 kHz on the host)" : "");
@@ -398,8 +457,26 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
     pthread_mutex_unlock(&g_render_mu);
     return RES_OK;
 }
+// Where the AudioRenderSystem sits inside AudioRendererImpl, read off the SDK's own ExecuteAudioRendererRendering: its prologue adds the offset to `this` (x0) before the first branch.
+//   +0x60 in SDK 16 and 20 (`add x0, x0, #0x60` and a jump), +0x50 in SDK 3.4 (SteamWorld Dig: `add x19, x0, #0x50`, sdk+0x188a10). SDK 16's +0x60 taken for SDK 3.4 read other fields as
+//   the execution mode and rendering device, so every render of the render thread failed with 0x40299 and played silence; only the game's updates rendered (catch-up frames, one per
+//   update at 60 Hz), heard as chopped sound. Anything not found keeps +0x60
+static size_t impl_sys_off(void) {
+    static _Atomic size_t found;   // the offset + 1 once looked up: an `add xd, x0, #0` gives +0
+    size_t k = atomic_load(&found);
+    if (k) return k - 1;
+    size_t off = 0x60;
+    const uint32_t *f = guest_sym("_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv");
+    for (int i = 0; f && i < 16; i++) {
+        uint32_t w = f[i];
+        if ((w & 0xffc003e0u) == 0x91000000u) { off = (w >> 10) & 0xfff; break; }   // add xd, x0, #imm12
+        if ((w & 0x7c000000u) == 0x14000000u) break;   // b / bl: no offset before the first branch
+    }
+    if (!atomic_exchange(&found, off + 1)) LOG("audren: AudioRenderSystem at +%#zx in AudioRendererImpl", off);
+    return off;
+}
 HLE_FORCE("_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv", "render one frame manually: SDK generates commands + CPU processing, the host takes the DeviceSink output",
-          Result, h_ar_ImplExec, uint8_t *impl) { return render_once(impl + 0x60, g_frame, &g_frame_n); }   // the AudioRenderSystem sits at +0x60 inside AudioRendererImpl
+          Result, h_ar_ImplExec, uint8_t *impl) { return render_once(impl + impl_sys_off(), g_frame, &g_frame_n); }
 // SDK 20 (The Legend of Zelda: Breath of the Wild 1.9.0): the public ExecuteAudioRendererRendering (sdk+0x221e90) calls the AudioRendererImpl version through the vtable (sdk+0x22ca88, just x0 += 0x60 and a jump through the PLT to here),
 // so the takeover above is never reached. The original generates commands here without the update lock; with the render thread on the original and the game thread's RequestUpdate rendering catch-up frames ("nothing rendered since the last update"),
 // both sides wrote the same command buffer at once and CommandListProcessor::Process sometimes read a half-written command list and crashed (once at 60 s and once at 134 s in the shrine). Taken over here, so rendering goes through the host's locked render as well
@@ -454,7 +531,26 @@ HLE_FORCE("_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv", "output c
 static _Atomic float g_dev_vol = 1.0f;
 HLE_FORCE("_ZN2nn5audio26SetAudioDeviceOutputVolumeEPKNS0_15AudioDeviceNameEf", "device volume; kept for the getter, not applied by the host", void, h_ad_SetVol, const char *name, float v) { (void)name; atomic_store(&g_dev_vol, v); }
 HLE_FORCE("_ZN2nn5audio26GetAudioDeviceOutputVolumeEPKNS0_15AudioDeviceNameE", "device volume: what the game last set (1.0 at start)", float, h_ad_GetVol, const char *name) { (void)name; return atomic_load(&g_dev_vol); }
-HLE_FORCE("_ZN2nn5audio39AcquireAudioDeviceNotificationForOutputEPNS_2os11SystemEventE", "output device change notification: bound, never signaled", void, h_ad_Notify, void *ev) { hle_bind_system_event(ev, 0); }
+// Output volume auto-tune (Switch 2 SDKs, through the audio device service the host does not serve; Donkey Kong Bananza reads it at boot, main+0x57dc7c): kept and read back, off at start
+static atomic_uchar g_dev_autotune;
+HLE_FORCE("_ZN2nn5audio40SetDeviceOutputVolumeAutoTuneModeEnabledEb", "device volume auto-tune; kept for the getter, not applied by the host", void, h_ad_SetAutoTune, unsigned on) { atomic_store(&g_dev_autotune, on & 1); }
+HLE_FORCE("_ZN2nn5audio39IsDeviceOutputVolumeAutoTuneModeEnabledEv", "device volume auto-tune: what the game last set (off at start)", unsigned, h_ad_AutoTune, void) { return atomic_load(&g_dev_autotune); }
+// Returns a Result (Metroid Dread's sdk+0x534a0): 0, or 0x499 when the notification is already acquired (a flag the SDK keeps for the process), before which it binds nothing
+static atomic_int g_ad_notify;
+HLE_FORCE("_ZN2nn5audio39AcquireAudioDeviceNotificationForOutputEPNS_2os11SystemEventE", "output device change notification: bound, never signaled", Result, h_ad_Notify, void *ev) {
+    if (atomic_exchange(&g_ad_notify, 1)) return 0x499;
+    hle_bind_system_event(ev, 0); return RES_OK;
+}
+// SDK 21's name of the same call (Splatoon Raiders' main+0x353b4d8; it tests the Result as above). Fire Emblem Fortune's Weave's sdk (SDK 22.2.0) calls it on an audio thread at
+// start (main+0xe7b9c): unserved, its user session with aud:u aborted (Result 0xe15). That sdk's version (sdk+0x1f1e00) keeps no per-process flag and attaches the event AutoClear;
+// the two differ only on a second acquire (0x499 here), which no game has been seen to make
+HLE_FORCE("_ZN2nn5audio36AcquireAudioOutputDeviceNotificationEPNS_2os11SystemEventE", "output device change notification (SDK 21 name): bound, never signaled", Result, h_ad_Notify21, void *ev) { return h_ad_Notify(ev); }
+// The input twin (Portal 2's main+0x19f37c, on its audio thread at start): the same shape with a flag of its own (SDK 13.3.0 sdk+0x56300: +0x851, the output's +0x852)
+static atomic_int g_ad_notify_in;
+HLE_FORCE("_ZN2nn5audio38AcquireAudioDeviceNotificationForInputEPNS_2os11SystemEventE", "input device change notification: bound, never signaled (the host has no microphone)", Result, h_ad_NotifyIn, void *ev) {
+    if (atomic_exchange(&g_ad_notify_in, 1)) return 0x499;
+    hle_bind_system_event(ev, 0); return RES_OK;
+}
 // SDK 7 names of the two above (Super Mario Odyssey): the device-switch event and the active channel count
 HLE_FORCE("_ZN2nn5audio36AcquireAudioDeviceSwitchNotificationEPNS_2os11SystemEventE", "output device switch notification (SDK 7 name): bound, never signaled", void, h_ad_Notify7, void *ev) { hle_bind_system_event(ev, 0); }
 HLE_FORCE("_ZN2nn5audio21GetActiveChannelCountEv", "output channel count (SDK 7 name): 2", int, h_ad_Channels7, void) { return 2; }

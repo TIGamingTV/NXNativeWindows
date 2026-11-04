@@ -1,4 +1,4 @@
-"""NSP script: NSZ / XCZ files in the NSP folder are listed by their ticket like NSPs (scan_nsps) and converted once with nsz -D into <title ID>_build/nsp/ (decompress_nsz):
+"""NSP script: NSZ / XCZ files in the NSP folder are listed by their ticket like NSPs (scan_nsps) and converted once with nsz -D into <build folder>/nsp/ (decompress_nsz):
 a conversion is moved in only when nsz exits 0 and made the file, and reused while its source is unchanged. nsz itself is stood in for (no game files, keys or nsz needed)."""
 import importlib.util
 import os
@@ -49,6 +49,8 @@ class Nsz(unittest.TestCase):
         self.assertEqual(staged.resolve(), self.keys.resolve())
         self.assertEqual(staged.read_text(), 'test keys\n')
         self.runs.append(src.name)
+        if src.suffix not in nsp.COMPRESSED: return   # the real nsz: PathTools.isCompressedGame takes a lowercase extension only, skips anything else and exits 0 with no output
+        self.assertEqual(src, src.resolve())   # and it resolves a symlink before it looks at the extension
         (out / (src.stem + nsp.COMPRESSED[src.suffix])).write_bytes(b'partial' if self.fail_conversion else b'nsp of ' + src.name.encode())
         if self.fail_conversion: raise nsp.BuildError('nsz exit code 1')
 
@@ -66,6 +68,14 @@ class Nsz(unittest.TestCase):
         nsp.decompress_nsz(self.tmp, app, nsp.scan_nsps(self.tmp)[1], self.keys, {})
         self.assertEqual(self.runs[2:], [self.upd.name])
 
+    def test_work_dir(self):   # --work-dir: the conversions go to the build folder named, nothing to the NSP folder
+        app, fam = nsp.scan_nsps(self.tmp)
+        work = self.tmp / 'builds' / 'game'
+        fam = nsp.decompress_nsz(self.tmp, app, fam, self.keys, {}, work)
+        self.assertEqual(fam['base'], work / 'nsp' / 'Game [v0].nsp')
+        self.assertTrue((work / 'nsp' / 'Game [v0].nsp.key').is_file())
+        self.assertFalse((self.tmp / f'{APP:016X}_build').exists())
+
     def test_relative_paths(self):
         previous_cwd = Path.cwd(); self.addCleanup(os.chdir, previous_cwd); os.chdir(self.tmp)
         app, fam = nsp.scan_nsps(Path('.'))
@@ -80,6 +90,34 @@ class Nsz(unittest.TestCase):
         self.assertEqual(fam['base'].suffix, '.xci')
         self.assertEqual(fam['base'].read_bytes(), b'nsp of Game [v0].xcz')
         self.assertFalse((fam['base'].parent / 'partial').exists())
+
+    def test_extension_in_capitals_is_converted(self):
+        self.upd.unlink()
+        for capitals, lower, made in (('.NSZ', '.nsz', '.nsp'), ('.XCZ', '.xcz', '.xci')):
+            with self.subTest(capitals=capitals):
+                src = self.base.with_suffix(capitals); self.base.rename(src); content = src.read_bytes()
+                app, fam = nsp.scan_nsps(self.tmp)
+                self.assertEqual(fam['base'], src)
+                fam = nsp.decompress_nsz(self.tmp, app, fam, self.keys, {})
+                self.assertEqual(fam['base'], self.tmp / f'{APP:016X}_build' / 'nsp' / f'Game [v0]{made}')
+                self.assertEqual(fam['base'].read_bytes(), f'nsp of Game [v0]{lower}'.encode())
+                self.assertEqual((sorted(p.name for p in self.tmp.iterdir() if p.is_file()), src.read_bytes()), ([src.name], content))   # the player's file stays as it was
+                self.assertFalse((fam['base'].parent / 'partial').exists())
+                src.rename(self.base)
+
+    def test_extension_in_capitals_without_a_hard_link(self):   # another volume, exFAT
+        self.upd.unlink(); src = self.base.with_suffix('.NSZ'); self.base.rename(src)
+        app, fam = nsp.scan_nsps(self.tmp)
+        with mock.patch.object(os, 'link', side_effect=OSError('no hard links')):
+            fam = nsp.decompress_nsz(self.tmp, app, fam, self.keys, {})
+        self.assertEqual(fam['base'].read_bytes(), b'nsp of Game [v0].nsz')
+        self.assertTrue(src.is_file())
+
+    def test_lowercase_extension_is_given_as_it_is(self):
+        self.upd.unlink()
+        with mock.patch.object(os, 'link') as link: nsp.decompress_nsz(self.tmp, *nsp.scan_nsps(self.tmp), self.keys, {})
+        link.assert_not_called()
+        self.assertEqual(self.runs, [self.base.name])
 
     def test_failed_conversion_is_not_kept(self):
         app, fam = nsp.scan_nsps(self.tmp); self.fail_conversion = True

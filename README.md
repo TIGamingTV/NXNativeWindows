@@ -62,6 +62,8 @@ What this fork adds on top of upstream, for every game:
 | **Launcher** | Upstream's single-screen launcher in UIKit, with memory-light defaults on 6 GB devices and Tile memory optimizations as an experiment. |
 | **Mods** | Emulator-layout mods (`exefs` IPS / pchtxt, `romfs`) from a `mods` folder, applied as rewriter cuts after a build-ID check. |
 | **Window** | A builder window (black and pink) besides the command line. |
+| **Touch controls editor** | **Edit touch controls…** in the in-game menu: drag, resize and hide every on-screen control, and add shortcut buttons that press a button combination (hold or toggle). Saved per layout (2D / 3D) and per arrangement ([Edit the touch controls](docs/playing.md#edit-the-touch-controls)). |
+| **Switch 2 games** | Upstream's Switch 2 support builds here too: ZBIC-compressed code modules (`pip install zbic`), NVN2 shaders through the same translator, and Mario Tennis Fever's run-time NRO captured on the device instead of the Mac host. |
 
 The PC this was built and tested on:
 
@@ -210,7 +212,7 @@ winget install --id LLVM.LLVM -e
 winget install --id Microsoft.DotNet.SDK.10 -e
 winget install --id KhronosGroup.VulkanSDK -e
 winget install --id Meta.Zstandard -e
-python -m pip install lz4 capstone fonttools pillow "backports.zstd; python_version < '3.14'"
+python -m pip install lz4 capstone fonttools pillow zbic "backports.zstd; python_version < '3.14'"
 ```
 
 You need Python 3.10 or later from [python.org](https://www.python.org/downloads/). Check "Add python.exe to PATH" when you install it.
@@ -382,6 +384,8 @@ Upstream lists about 65 playable games in its [games table](dm/games/README.md#g
   3. In the Files app, copy the folder (`glslc_capture` or `vk_capture`) next to the game files on the PC, and build again. The build checks it against the profile's table and makes the real IPA.
 - **Oodle, Unreal and LZ5 games** (Octopath Traveler 0 / II, Bayonetta 3, ASTRAL CHAIN, Pokémon Legends: Z-A, DRAGON QUEST XI S, FINAL FANTASY RESONANCE) decode their shader archives with the game's own decoder, run in an emulated ARM64 machine ([`win/oodle_emu.py`](win/oodle_emu.py), [`win/arm64_emu.py`](win/arm64_emu.py)). Octopath Traveler 0's 10,596 Oodle-compressed shaders decode this way.
 - **Games without an upstream profile** (Megabyte Punch) get a provisional profile guessed from a survey. The IPA is a best effort and may not boot until the game is brought up ([docs/agents](docs/agents/README.md)).
+- **Switch 2 games** (Mario Kart World, Donkey Kong Bananza, Splatoon Raiders, Fire Emblem Fortune's Weave, Hyrule Warriors: Age of Imprisonment, Pokémon Pokopia) build as on a Mac. Their code modules are ZBIC-compressed: install `zbic` (`python -m pip install zbic`), and use `prod.keys` from a system new enough for the game. **Mario Tennis Fever** decodes its code at run time: the first build packs `<Game>-capture.ipa`; open it and press **Play** (it closes itself within seconds), copy its `nro_capture` folder from the Files app next to the game files, and build again. Upstream tests these games on the Mac; this fork's Windows path for them is compile-checked, not yet played on a device.
+- **Super Mario 3D All-Stars** packs as one app of several programs (the launcher, Super Mario 64 and Super Mario Sunshine), as upstream does (`PROGRAMS_TSV`).
 - **Use the tested version.** Another version builds with its own shaders, but the fixes made for the tested build (60 fps patches and others) do not apply, and the build says so.
 
 ## Building on Linux
@@ -406,10 +410,13 @@ The same driver, `win/build_ipa_windows.py`, also runs on Linux. There it calls 
 - **Windows build path** in [`win/`](win/), and the window `Build-IPA-GUI.bat`. The same path runs on Linux ([win/LINUX.md](win/LINUX.md)).
 - **Default bundle ID `org.nxnativewindows.<title ID>`** in every build path, so these apps install beside upstream-built ones.
 - **Derived profiles** get a RomFS marker that their version has (Balatro v0 lacks 1.1.3's marker file).
-- **`pack_ipa.py --exec`** sets the executable's mode when packing on Windows.
+- **`pack_ipa.py --exec`** sets the executable's mode when packing on Windows (and from a copy without the x bit, on any system).
 - **`.gitattributes`** keeps every file byte-identical to upstream on Windows, and the shim writes every pipeline text file with LF line ends, as on a Mac. With CRLF, the host refused the shader libraries' stamp.
 - **BC textures on GPUs without BC** (A16 and older) are decoded on the CPU ([`dm/gfx/tex/bc_soft.c`](dm/gfx/tex/bc_soft.c); `DM_BC_SOFT=1` forces it, `=0` turns it off).
 - **Address-region cuts for unregistered `sdk` builds** are found from the code ([`win/sdk_auto_cuts.py`](win/sdk_auto_cuts.py)).
+- **The touch controls editor** ([`dm/ios/Sources/DmPadEditor.m`](dm/ios/Sources/DmPadEditor.m), with hooks in `DmGamepad.m`), opened from the in-game menu in both `GameMenu.swift` and this port's [`win/ios/GameMenu.m`](win/ios/GameMenu.m).
+- **The device check** in `main.m` refuses no GPU: upstream turns away GPUs without BC textures, which this port decodes.
+- **Run-time captures on the device**: GLSLC, Vulkan and GL shaders and the NRO a boot stub decodes (Mario Tennis Fever) come from a capture IPA instead of the Mac host.
 
 ## Repository layout
 
@@ -421,7 +428,9 @@ The same driver, `win/build_ipa_windows.py`, also runs on Linux. There it calls 
 | `win/build_app.py` | the app build that replaces `build_ipa.sh` / Xcode |
 | `win/xcrun.py`, `win/toolchain.py` | the `xcrun` stand-in and the tool locator |
 | `win/pyshim/sitecustomize.py` | the subprocess shim loaded by every pipeline Python |
-| `win/ios/Launcher.m`, `win/ios/compat_rt.c` | the UIKit launcher and the `@available` runtime |
+| `win/ios/Launcher.m`, `win/ios/Launcher.h`, `win/ios/GameMenu.m` | the UIKit launcher (settings, cloud saves) and in-game menu: the Swift ones' stand-ins |
+| `win/ios/compat_rt.c`, `win/ios/DataHelp.m`, `win/ios/nxw_unzip.c` | the `@available` runtime; the split build's data screen and ZIP import |
+| `dm/ios/Sources/DmPadEditor.h`, `.m` | the touch controls editor (saved layouts, toolbar, shortcut sheet) |
 | `win/love_shaders.py` | LÖVE run-time shaders, offline |
 | `win/sdk_auto_cuts.py` | address-region cuts for unregistered `sdk` builds |
 | `win/sdk/extract_xip.py` | iPhoneOS SDK from `Xcode.xip` |
@@ -436,7 +445,7 @@ Local files git ignores: `win/toolchain.json`, `win/gui_settings.json`, `win/sdk
 
 ## Updating from upstream
 
-Last synced with [seedds/nxnative](https://github.com/seedds/nxnative) on 2026-10-27 (135 upstream commits: Kirby and the Forgotten Land's profile, the RomFS image extraction, the region check, the newer launcher contract, and more). The sync before it, on 2026-10-26 (46 upstream commits), brought MetalFX upscaling and the single-screen launcher, offline pipeline archives, the prepare step, hybrid pipelines, Pokémon Shield and Brilliant Diamond, Echoes of Wisdom 1.1.0 and thermal frame-rate caps. The offline pipeline archive (`DM_PSO_GPUS`, default for games whose profile sets `pso_mtl4`) builds on Windows too: Metal Developer Tools for Windows ship `metal-tt`.
+Last synced with [seedds/nxnative](https://github.com/seedds/nxnative) on 2026-11-04 (393 upstream commits: Switch 2 games, among them Mario Kart World, Mario Tennis Fever, Donkey Kong Bananza and Pokémon Pokopia; Super Mario 3D All-Stars as a game of several programs; dav1d AV1 movies; the host's Metal shaders compiled when it is built; the in-game menu, TV output and cloud saves; Unreal, Snowdrop and Unity finds that replace fixed addresses; and many fixes). `win/build_app.py` follows the new host sources (`save_sync.c`, `web_apple.m`, dav1d with its own flags, `host_msl.py` through `win/xcrun.py`), the multi-program layout, the `jit/` and `html/` folders and `DMCommit` / `DMChain`. The sync before it, on 2026-10-27 (135 upstream commits: Kirby and the Forgotten Land's profile, the RomFS image extraction, the region check, the newer launcher contract, and more). The one before, on 2026-10-26 (46 upstream commits), brought MetalFX upscaling and the single-screen launcher, offline pipeline archives, the prepare step, hybrid pipelines, Pokémon Shield and Brilliant Diamond, Echoes of Wisdom 1.1.0 and thermal frame-rate caps. The offline pipeline archive (`DM_PSO_GPUS`, default for games whose profile sets `pso_mtl4`) builds on Windows too: Metal Developer Tools for Windows ship `metal-tt`.
 
 ```
 git remote add upstream https://github.com/seedds/nxnative.git

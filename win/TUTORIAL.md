@@ -17,7 +17,7 @@ winget install --id LLVM.LLVM -e
 winget install --id Microsoft.DotNet.SDK.10 -e
 winget install --id KhronosGroup.VulkanSDK -e
 winget install --id Meta.Zstandard -e
-python -m pip install lz4 capstone fonttools pillow
+python -m pip install lz4 capstone fonttools pillow zbic
 ```
 
 Python harus sudah terpasang (python.org, versi 3.10 atau lebih baru). Dua alat dari Apple perlu login Apple ID gratis di developer.apple.com/download:
