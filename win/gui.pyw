@@ -4,6 +4,8 @@
 # (app name, bundle ID org.nxnativewindows.<title ID>, language, frame-rate counter) and shows its JSON progress events.
 # The pipeline packs every game file in one folder; when the picked files share their folder with other games' files, they are hard-linked (copied on another drive)
 # into a folder of their own first. Start: double-click Build-IPA-GUI.bat in the repository root, or this file (pythonw).
+# A Switch 2 game comes as one NUP container (a .nup file) or a folder of its files (base/exefs, base/romfs, updates/<version>/, dlc/<title ID>/; scripts/pack_dump.py):
+# either is handed to the pipeline as it is, and needs no prod.keys (its files are not encrypted). Both build only a game with a profile.
 import json, math, os, queue, re, shutil, subprocess, sys, threading, time, tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
@@ -13,6 +15,34 @@ REPO = WIN.parent
 sys.path.insert(0, str(WIN))
 SETTINGS = WIN / 'gui_settings.json'   # the last picked files and keys (this PC only; git ignores it)
 GAME_EXT = ('.nsp', '.xci', '.nsz', '.xcz')
+
+
+def is_nup(p):   # scripts/pack_nup.py is_nup: the container's magic
+    try:
+        with open(p, 'rb') as f: return f.read(3) == b'NUP'
+    except OSError: return False
+
+
+def is_dump(d):   # scripts/pack_dump.py is_dump: base/exefs/main.npdm, and a RomFS in base/ or an update
+    d = Path(d)
+    return (d / 'base/exefs/main.npdm').is_file() and ((d / 'base/romfs').is_dir() or any(p.is_dir() for p in d.glob('updates/*/romfs')))
+
+
+def source_kind(files):
+    """'nup' (one .nup file), 'dump' (one folder of the game's files) or 'nsp' (NSP / XCI / NSZ / XCZ packages). The first two need no prod.keys"""
+    if len(files) == 1:
+        p = Path(files[0])
+        if p.is_file() and is_nup(p): return 'nup'
+        if p.is_dir() and is_dump(p): return 'dump'
+    return 'nsp'
+
+
+def dump_root(d):
+    """The dump folder for a picked folder: itself, or the folder above when base/, updates/, updates/<version>/ or dlc/ of a dump was picked"""
+    d = Path(d)
+    for c in (d, d.parent, d.parent.parent):
+        if is_dump(c): return c
+    return None
 
 # ---- theme: black and pink ----
 BG, CARD, FIELD, FIELD_HI, BORDER = '#09090c', '#131318', '#1b1b22', '#25252f', '#26262f'
@@ -214,6 +244,7 @@ class App(tk.Tk):
         self.geometry('840x980'); self.minsize(720, 760)
         self.s = load_settings()
         self.files = [f for f in self.s.get('files', []) if Path(f).exists()]
+        if any(Path(f).is_dir() for f in self.files) and source_kind(self.files) != 'dump': self.files = []
         self.keys = self.s.get('keys', '') if Path(self.s.get('keys', '') or '.').is_file() else ''
         self.out = ''
         self.proc, self.q, self.out_ipa, self.started, self.n, self.details = None, queue.Queue(), None, 0, 1, False
@@ -314,7 +345,7 @@ class App(tk.Tk):
         for k, v in (('App name', "the game's own name"), ('Bundle ID', 'org.nxnativewindows.<title ID>'), ('Language', "the game's default (en-US when it has it)"),
                      ('IPA', 'saved next to your game files'), ('Package', 'one IPA, or app + data folder (step 03)'), ('Memory', 'Increased Memory Limit asked for (step 03)'), ('Signing', 'ad-hoc; SideStore re-signs it when you install')):
             self._write(f'  {k:<10}', 'dim'); self._write(f'{v}\n')
-        self._write('\nPick the game files and prod.keys above, then press Build IPA.\n', 'dim')
+        self._write('\nPick the game files and prod.keys above, then press Build IPA.\nA Switch 2 game: pick its .nup file, or its folder (base/, updates/, dlc/) with Choose folder; it needs no prod.keys.\n', 'dim')
 
     def _step(self, parent, n, title, sub):
         tk.Label(parent, text=f'{int(n):02d}', bg=CARD, fg=PINK, font=(MONO, 10, 'bold')).pack(side='left', anchor='n', pady=(2, 0))
@@ -333,30 +364,37 @@ class App(tk.Tk):
         rounded(c, 1, 1, w - 1, h - 1, 14, fill=FIELD if hover else '#16161c', outline=PINK if hover else '#3a3a48', dash=(6, 4), width=1)
         c.create_oval(w // 2 - 17, 22, w // 2 + 17, 56, fill=PINK_DEEP, outline='')
         c.create_text(w // 2, 38, text='+', fill=PINK, font=(FONT_D, 18, 'bold'))
-        c.create_text(w // 2, 76, text='Click to choose your NSP / XCI files', fill=TEXT, font=(FONT, 10, 'bold'))
-        c.create_text(w // 2, 96, text='NSZ and XCZ work too', fill=FAINT, font=(FONT, 9))
+        c.create_text(w // 2, 76, text='Click to choose your NSP / XCI files, or a Switch 2 .nup', fill=TEXT, font=(FONT, 10, 'bold'))
+        c.create_text(w // 2, 96, text='NSZ and XCZ work too. A Switch 2 game folder (base/, updates/, dlc/): Choose folder above', fill=FAINT, font=(FONT, 9))
 
     def _refresh(self):
         for wdg in self.rows.winfo_children(): wdg.destroy()
         if not self.files:
-            self.rows.pack_forget(); self.drop.pack(fill='x'); self.more.pack_forget()
+            self.rows.pack_forget(); self.drop.pack(fill='x')
         else:
-            self.drop.pack_forget(); self.rows.pack(fill='x'); self.more.pack(side='right')
+            self.drop.pack_forget(); self.rows.pack(fill='x')
             for i, f in enumerate(self.files):
                 p = Path(f); r = Surface(self.rows, pad=10, radius=12, fill=FIELD, outline=BORDER, bg=CARD); r.pack(fill='x', pady=(0, 6))
                 rb = r.body; rb.configure(bg=FIELD)
                 tid = title_id([f])   # base titles end in 000, updates in 800, DLC in anything else
-                kind = (p.suffix[1:].upper() if not tid else 'BASE' if tid.endswith('000') else 'UPD' if tid.endswith('800') else 'DLC')
+                src = source_kind([f])
+                kind = ('NUP' if src == 'nup' else 'DIR' if src == 'dump' else p.suffix[1:].upper() if not tid else 'BASE' if tid.endswith('000') else 'UPD' if tid.endswith('800') else 'DLC')
                 Badge(rb, kind, bg=FIELD, size=32).pack(side='left')
-                name = p.name if len(p.name) < 62 else p.name[:58] + '…'
+                name = str(p) if src == 'dump' else p.name
+                name = name if len(name) < 62 else '…' + name[-58:] if src == 'dump' else name[:58] + '…'
                 tk.Label(rb, text=name, bg=FIELD, fg=TEXT, font=(FONT, 10), anchor='w').pack(side='left', padx=12, fill='x', expand=True)
                 x = tk.Label(rb, text='✕', bg=FIELD, fg=FAINT, font=(FONT, 10), cursor='hand2'); x.pack(side='right', padx=(10, 4))
                 x.bind('<Button-1>', lambda e, i=i: self._remove(i)); x.bind('<Enter>', lambda e, x=x: x.configure(fg=BAD)); x.bind('<Leave>', lambda e, x=x: x.configure(fg=FAINT))
-                tk.Label(rb, text=human(p.stat().st_size) if p.exists() else 'missing', bg=FIELD, fg=MUTED, font=(FONT, 9)).pack(side='right')
+                size = 'game folder' if src == 'dump' else human(p.stat().st_size) if p.exists() else 'missing'
+                tk.Label(rb, text=size, bg=FIELD, fg=MUTED, font=(FONT, 9)).pack(side='right')
         for wdg in self.key_row.winfo_children(): wdg.destroy()
         r = Surface(self.key_row, pad=10, radius=12, fill=FIELD, outline=BORDER, bg=CARD); r.pack(fill='x')
         rb = r.body; rb.configure(bg=FIELD)
-        if self.keys:
+        if not self.needs_keys():
+            Badge(rb, 'KEY', bg=FIELD, size=32, fill=FIELD_HI, fg=FAINT).pack(side='left')
+            tk.Label(rb, text='Not needed: a NUP or a game folder is not encrypted', bg=FIELD, fg=MUTED, font=(FONT, 10), anchor='w').pack(side='left', padx=12)
+            tk.Label(rb, text='✓', bg=FIELD, fg=OK, font=(FONT, 11, 'bold')).pack(side='right', padx=4)
+        elif self.keys:
             Badge(rb, 'KEY', bg=FIELD, size=32).pack(side='left')
             tk.Label(rb, text=self.keys, bg=FIELD, fg=TEXT, font=(FONT, 10), anchor='w').pack(side='left', padx=12, fill='x', expand=True)
             tk.Label(rb, text='✓', bg=FIELD, fg=OK, font=(FONT, 11, 'bold')).pack(side='right', padx=4)
@@ -369,18 +407,27 @@ class App(tk.Tk):
         if self.out: self.out_lbl.configure(text=f'Saves to  {self.out}'); self.out_reset.pack(side='left')
         else: self.out_lbl.configure(text=f'{what} saved next to your game files'); self.out_reset.pack_forget()
         if not self.proc:
-            if self.files and self.keys: self.btn.set('ready', 'Build IPA')
+            if self.files and (self.keys or not self.needs_keys()): self.btn.set('ready', 'Build IPA')
+            elif self.files: self.btn.set('disabled', 'Add prod.keys to start')
             else: self.btn.set('disabled', 'Add game files and prod.keys to start')
         self.after_idle(lambda: Surface.fit_all(self))
 
     # ---- pickers ----
     def _initial(self): return self.s.get('dir') or str(Path.home())
 
+    def needs_keys(self): return source_kind(self.files) == 'nsp'
+
     def _add_files(self):
         if self.proc: return
-        fs = filedialog.askopenfilenames(title='Choose game files', initialdir=self._initial(), filetypes=[('Switch games', '*.nsp *.xci *.nsz *.xcz'), ('All files', '*.*')])
+        fs = filedialog.askopenfilenames(title='Choose game files', initialdir=self._initial(),
+                                         filetypes=[('Switch games', '*.nsp *.xci *.nsz *.xcz *.nup'), ('Switch 2 NUP', '*.nup'), ('All files', '*.*')])
         if fs:
             self.s['dir'] = str(Path(fs[0]).parent)
+            nups = [str(Path(f)) for f in fs if is_nup(f)]
+            if nups:   # a NUP holds the base game, its updates and DLC: it is packed on its own
+                if len(nups) > 1 or len(nups) != len(fs): messagebox.showinfo('NUP', f'A NUP holds the whole game and is built on its own: using {Path(nups[0]).name}.')
+                self.files = nups[:1]; self._after_pick(); return
+            if source_kind(self.files) != 'nsp': self.files = []   # NSPs replace an earlier NUP or game folder
             for f in fs:
                 if str(Path(f)) not in self.files: self.files.append(str(Path(f)))
             self._after_pick()
@@ -391,7 +438,17 @@ class App(tk.Tk):
         if not d: return
         self.s['dir'] = d
         found = sorted(str(p) for p in Path(d).iterdir() if p.suffix.lower() in GAME_EXT)
-        if not found: messagebox.showwarning('No game files', f'No NSP / XCI / NSZ / XCZ files in\n{d}'); return
+        if not found:   # a Switch 2 game: a folder of its files, or a folder holding its .nup
+            root = dump_root(d)
+            nups = sorted(str(p) for p in Path(d).iterdir() if p.is_file() and p.suffix.lower() == '.nup' and is_nup(p))
+            if root: self.files = [str(root)]
+            elif len(nups) == 1: self.files = nups
+            elif nups: messagebox.showinfo('More than one NUP', f'{d} holds {len(nups)} NUP files. Choose one with Add files.'); return
+            else:
+                messagebox.showwarning('No game files', f'No NSP / XCI / NSZ / XCZ / NUP files in\n{d}\n\nA Switch 2 game folder needs this layout:\n'
+                                       '  base\\exefs\\   main, main.npdm, sdk, rtld\n  base\\romfs\\\n  updates\\<version>\\exefs and romfs   (optional)\n  dlc\\<DLC title ID>\\0\\romfs   (optional)')
+                return
+            self._after_pick(); return
         if len({title_id([f])[:12] for f in found if title_id([f])}) > 1:
             messagebox.showinfo('More than one game', 'This folder holds several games. Remove the other games\' files from the list (✕).')
         self.files = found
@@ -399,7 +456,7 @@ class App(tk.Tk):
         self._after_pick()
 
     def _after_pick(self):
-        if not self.keys:
+        if not self.keys and self.needs_keys():
             for f in self.files:
                 k = Path(f).parent / 'prod.keys'
                 if k.is_file(): self.keys = str(k); break
@@ -442,21 +499,30 @@ class App(tk.Tk):
 
     # ---- build ----
     def _start(self):
-        if self.proc or not (self.files and self.keys): return
-        if not Path(self.keys).is_file(): messagebox.showwarning('prod.keys', 'The prod.keys file is gone. Choose it again.'); return
-        try: folder, copied = stage_folder(self.files)
-        except OSError as e: messagebox.showerror('Game files', str(e)); return
-        cmd = [console_python(), '-u', str(WIN / 'build_ipa_windows.py'), str(folder), '-k', self.keys, '--progress', 'json']
+        keyless = not self.needs_keys()
+        if self.proc or not (self.files and (self.keys or keyless)): return
+        if not keyless and not Path(self.keys).is_file(): messagebox.showwarning('prod.keys', 'The prod.keys file is gone. Choose it again.'); return
+        if keyless:   # a .nup file or a game folder: the pipeline takes it as it is (the NUP's folder, or the game folder, holds the build folder and the IPA)
+            src = Path(self.files[0])
+            if not src.exists(): messagebox.showwarning('Game files', f'{src} is gone. Choose it again.'); return
+            folder, copied = src, None
+            cmd = [console_python(), '-u', str(WIN / 'build_ipa_windows.py'), str(folder), '--progress', 'json']
+        else:
+            try: folder, copied = stage_folder(self.files)
+            except OSError as e: messagebox.showerror('Game files', str(e)); return
+            cmd = [console_python(), '-u', str(WIN / 'build_ipa_windows.py'), str(folder), '-k', self.keys, '--progress', 'json']
         if self.out: cmd += ['-o', self.out]
         if self.split: cmd += ['--split-data']
         cmd += ['--entitlements' if self.iml else '--no-entitlements']
         self.s.update(files=self.files, keys=self.keys); save_settings(self.s)
         self._clear_log()
-        self._write(f'Game folder  {folder}' + ('  (hard links to your files)' if folder != Path(self.files[0]).parent else '') + '\n', 'dim')
+        if keyless: self._write(('NUP  ' if folder.is_file() else 'Game folder  ') + f'{folder}  (no prod.keys needed)\n', 'dim')
+        else: self._write(f'Game folder  {folder}' + ('  (hard links to your files)' if folder != Path(self.files[0]).parent else '') + '\n', 'dim')
         if copied: self._write(f'Copied (another drive, no hard link possible): {", ".join(copied)}\n', 'dim')
         self.out_ipa, self.started, self.warn = None, time.time(), []
         env = dict(os.environ, PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
-        mods = next((d for d in (Path(folder) / 'mods', Path(self.files[0]).parent / 'mods') if d.is_dir()), None)   # win/mods.py: the emulators' mod layout beside the game files
+        base = Path(folder).parent if Path(folder).is_file() else Path(folder)
+        mods = next((d for d in (base / 'mods', Path(self.files[0]).parent / 'mods') if d.is_dir()), None)   # win/mods.py: the emulators' mod layout beside the game files
         if mods: env['NXW_MODS_DIR'] = str(mods); self._write(f'Mods  {mods}\n', 'dim')
         try:
             self.proc = subprocess.Popen(cmd, cwd=str(REPO), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,

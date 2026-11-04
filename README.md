@@ -270,7 +270,8 @@ Every line should read `[ok ]`, ending with `everything a build needs is there`.
 Double-click **`Build-IPA-GUI.bat`** in the repository folder.
 
 1. **Game files**: click the dashed box to pick your NSP / XCI files (base, update and DLC of one game), or use *Choose folder*. Each file shows as BASE, UPD or DLC with its size. *✕* removes one.
-2. **prod.keys**: click *Browse*. The window finds `prod.keys` by itself when it sits next to the game files.
+   A **Switch 2 game** is picked the same way, from one NUP container or a folder of its files (see [Switch 2 games in the window](#switch-2-games-in-the-window)).
+2. **prod.keys**: click *Browse*. The window finds `prod.keys` by itself when it sits next to the game files. A NUP or a game folder needs none.
 3. **Package**: *Single IPA* (everything in one file) or *App + data folder* (see [Split builds](#split-builds-small-ipa--data-folder)). Below it, **Increased Memory Limit** *On* (default: the app asks for the entitlement in its own signature) or *Off* (same as `--no-entitlements`).
 4. Click **Build IPA**. The button turns into the progress bar (stage, step, percentage). A green card then shows the IPA, and *Show in folder* opens it.
 
@@ -283,6 +284,24 @@ Every build uses the defaults. *Details*, shown from the start, lists them:
 - Signing: none (Sideloadly signs the IPA when you install it)
 
 When the folder you pick also holds another game's files, the window hard-links the chosen files into a folder of their own (`<title ID>_nxw`, next to them). The pipeline packs every game file in its folder, so this keeps the games apart, and hard links take no extra disk space.
+
+### Switch 2 games in the window
+
+A Switch 2 game is built from one [NUP](https://github.com/a55uka/nup) container (a `.nup` file) or a folder of its files, not from NSPs. Neither needs `prod.keys`, and both work only for a game that has a profile (the Switch 2 games in upstream's [games table](dm/games/README.md#games)). The window builds the IPA itself, as for a Switch 1 game:
+
+- **A `.nup` file** (the base game, its updates and DLC in one file): click the dashed box (or *Add files*) and pick it, or *Choose folder* on the folder that holds it. It shows as **NUP**. The newest update is packed.
+- **A folder of files**: *Choose folder* and pick the game's folder (picking its `base`, `updates` or an update's folder finds the game folder above it too). It shows as **DIR**. The layout (`updates` and `dlc` are optional):
+
+  ```
+  DonkeyKongBananza\
+    base\exefs\                     main, main.npdm, sdk, rtld
+    base\romfs\
+    updates\458752\exefs\           the update's version, as a decimal number
+    updates\458752\romfs\           the patched RomFS, not a patch
+    dlc\040074a01bf13001\0\romfs\   the DLC's title ID
+  ```
+
+The *prod.keys* step then reads *Not needed*, and **Build IPA** runs the build. The IPA and the `<title ID>_build` folder go next to the `.nup` file, or into the game folder. A NUP with the game's control data gives the app the game's name and icon; a folder has neither, so the name comes from the profile and the app has no icon. From a terminal the same build is `python win\build_ipa_windows.py <the .nup file or the game folder>`, with no `-k`.
 
 ## Build an IPA from a terminal
 
@@ -384,7 +403,7 @@ Upstream lists about 65 playable games in its [games table](dm/games/README.md#g
   3. In the Files app, copy the folder (`glslc_capture` or `vk_capture`) next to the game files on the PC, and build again. The build checks it against the profile's table and makes the real IPA.
 - **Oodle, Unreal and LZ5 games** (Octopath Traveler 0 / II, Bayonetta 3, ASTRAL CHAIN, Pokémon Legends: Z-A, DRAGON QUEST XI S, FINAL FANTASY RESONANCE) decode their shader archives with the game's own decoder, run in an emulated ARM64 machine ([`win/oodle_emu.py`](win/oodle_emu.py), [`win/arm64_emu.py`](win/arm64_emu.py)). Octopath Traveler 0's 10,596 Oodle-compressed shaders decode this way.
 - **Games without an upstream profile** (Megabyte Punch) get a provisional profile guessed from a survey. The IPA is a best effort and may not boot until the game is brought up ([docs/agents](docs/agents/README.md)).
-- **Switch 2 games** (Mario Kart World, Donkey Kong Bananza, Splatoon Raiders, Fire Emblem Fortune's Weave, Hyrule Warriors: Age of Imprisonment, Pokémon Pokopia) build as on a Mac. Their code modules are ZBIC-compressed: install `zbic` (`python -m pip install zbic`), and use `prod.keys` from a system new enough for the game. **Mario Tennis Fever** decodes its code at run time: the first build packs `<Game>-capture.ipa`; open it and press **Play** (it closes itself within seconds), copy its `nro_capture` folder from the Files app next to the game files, and build again. Upstream tests these games on the Mac; this fork's Windows path for them is compile-checked, not yet played on a device.
+- **Switch 2 games** (Mario Kart World, Donkey Kong Bananza, Splatoon Raiders, Fire Emblem Fortune's Weave, Hyrule Warriors: Age of Imprisonment, Pokémon Pokopia) build as on a Mac. Their code modules are ZBIC-compressed: install `zbic` (`python -m pip install zbic`). Pick a `.nup` file or a folder of the game's files in the window ([Switch 2 games in the window](#switch-2-games-in-the-window)), which needs no `prod.keys`; from NSPs, use `prod.keys` from a system new enough for the game. **Mario Tennis Fever** decodes its code at run time: the first build packs `<Game>-capture.ipa`; open it and press **Play** (it closes itself within seconds), copy its `nro_capture` folder from the Files app next to the game files, and build again. Upstream tests these games on the Mac; this fork's Windows path for them is compile-checked, not yet played on a device.
 - **Super Mario 3D All-Stars** packs as one app of several programs (the launcher, Super Mario 64 and Super Mario Sunshine), as upstream does (`PROGRAMS_TSV`).
 - **Use the tested version.** Another version builds with its own shaders, but the fixes made for the tested build (60 fps patches and others) do not apply, and the build says so.
 
