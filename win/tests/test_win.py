@@ -44,6 +44,15 @@ class Shim(unittest.TestCase):
         self.assertIn("build_app.py', 'out.ipa']", r.stderr)
 
     @unittest.skipUnless(os.name == 'nt', 'the shim is active on Windows only')
+    def test_binary_open_and_pread(self):   # dm/gfx/tools/dmsh_build.py rec_of: os.open(path, os.O_RDONLY) + os.pread on a package with CR LF and 0x1A bytes
+        with tempfile.TemporaryDirectory() as t:
+            f = Path(t) / 'p.bin'; data = bytes(range(256)) * 8 + b'\r\n\x1a\r\n' * 50; f.write_bytes(data)
+            r = self.run_mapped(f'import os\nfd = os.open({str(f)!r}, os.O_RDONLY); os.lseek(fd, 3, 0)\n'
+                                f'assert os.pread(fd, 200, 2000) == open({str(f)!r}, "rb").read()[2000:2200]\n'
+                                'assert os.lseek(fd, 0, 1) == 3\nprint("pread ok", len(os.read(fd, 10**6)))')
+            self.assertEqual(r.returncode, 0, r.stderr); self.assertIn(f'pread ok {len(data) - 3}', r.stdout)
+
+    @unittest.skipUnless(os.name == 'nt', 'the shim is active on Windows only')
     def test_dump_folder_pack(self):   # scripts/pack_dump.py's ExeFS copy (cp -c) and dm/tools/romfs_image.py's guest names (xattr): a Switch 2 game folder
         with tempfile.TemporaryDirectory() as t:
             src = Path(t) / 'base'; (src / 'exefs').mkdir(parents=True); (src / 'romfs/.dm-case-1').mkdir(parents=True)

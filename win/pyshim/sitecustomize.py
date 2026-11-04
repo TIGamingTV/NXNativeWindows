@@ -26,6 +26,33 @@ if (os.name == 'nt' or os.environ.get('NXW_LINUX')) and not os.environ.get('NXW_
         return _open(file, mode, buffering, encoding, errors, newline, closefd, opener)
     io.open = builtins.open = _lf_open
 
+    # os.open and os.pread as on a Mac. Windows opens a descriptor in text mode unless O_BINARY is given (os.read then turns CR LF into LF and stops at a 0x1A byte), and has no
+    # os.pread at all: dm/gfx/tools/dmsh_build.py rec_of reads each shader's record from its package with os.open(path, os.O_RDONLY) and os.pread (AttributeError on Windows).
+    # Every os.open that names no O_TEXT is binary; os.pread is a seek and a read under one lock (the same descriptor may be read by several threads), and leaves the
+    # descriptor's offset where it was, as pread does
+    if os.name == 'nt':
+        import threading
+        _os_open = os.open
+        def _bin_open(path, flags, mode=0o777, *, dir_fd=None):
+            if not flags & getattr(os, 'O_TEXT', 0): flags |= getattr(os, 'O_BINARY', 0)
+            return _os_open(path, flags, mode, dir_fd=dir_fd)
+        os.open = _bin_open
+        if not hasattr(os, 'pread'):
+            _pread_lock = threading.Lock()
+            def _pread(fd, n, offset):
+                if offset < 0: raise OSError(22, 'Invalid argument')
+                with _pread_lock:
+                    keep = os.lseek(fd, 0, os.SEEK_CUR)
+                    try:
+                        os.lseek(fd, offset, os.SEEK_SET); out = []
+                        while n > 0:
+                            b = os.read(fd, n)
+                            if not b: break
+                            out.append(b); n -= len(b)
+                        return b''.join(out)
+                    finally: os.lseek(fd, keep, os.SEEK_SET)
+            os.pread = _pread
+
     # os.replace as on a Mac: Windows refuses to replace a file another thread has open, which POSIX rename allows. The shader build's content-addressed caches
     # (dmsh_mtlcache.py) have threads finish the same entry at once; a replace that keeps failing onto an existing file of the same size is that race, and the copy goes
     import time as _time
