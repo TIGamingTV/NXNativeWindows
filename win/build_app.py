@@ -280,7 +280,7 @@ def split_data(data, parts, stamp, name, skip_suffix=()):
 
 # The UIKit stand-ins for the Swift sources (no Swift toolchain on Windows): the launcher (Launcher.swift, LauncherSettings.swift, LauncherRow.swift), the in-game menu
 # (GameMenu.swift), the split build's data screen and its ZIP import
-WIN_IOS_SOURCES = ('Launcher.m', 'GameMenu.m', 'DataHelp.m', 'nxw_unzip.c')
+WIN_IOS_SOURCES = ('Launcher.m', 'GameMenu.m', 'DataHelp.m', 'nxw_unzip.c', 'save_transfer.c')
 
 
 def chain_version():

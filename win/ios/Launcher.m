@@ -14,6 +14,11 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import "Launcher.h"
 #import "CloudSaves.h"
+#import <objc/runtime.h>
+#include "game_profile.h"   // DM_GAME_ID: the title a packed save belongs to (save_transfer.h)
+#include "save_transfer.h"
+#include <dlfcn.h>
+#include <limits.h>
 #include <math.h>
 #include <os/proc.h>
 #include <stdio.h>
@@ -247,7 +252,30 @@ static int increased_memory_limit(void) {
 @interface DmSettingsVC : UITableViewController <UIDocumentPickerDelegate>
 @property (strong) DmLauncherModel *m; @property (strong) NSTimer *timer; @property (strong) UILabel *memory;
 @property (copy) NSString *cloudNote;   // the Cloud saves footer after a pick (Launcher.swift CloudSavesSection)
+@property NSInteger pickMode;           // the document picker on screen: PICK_FOLDER, PICK_EXPORT or PICK_IMPORT
+@property (strong) NSURL *exported;     // the packed save an export picker copies out, removed once it is done
 @end
+enum { PICK_FOLDER, PICK_EXPORT, PICK_IMPORT };
+
+// A tweak injected into the app that rewrites the document picker (FilePickerFix and its kind: every picker becomes a copy picker, the copy moved into Documents) puts its
+// own code behind -initForOpeningContentTypes:asCopy:. iOS cannot copy a folder, so the Cloud saves folder picker would close the app (an exception in UIKit): it is
+// not shown then. The method's code is the system's (UIKit, in /System/Library) unless something replaced it; a tweak sits in the app (Frameworks) or /Library
+static BOOL folder_picker_hooked(void) {
+    Method m = class_getInstanceMethod(UIDocumentPickerViewController.class, @selector(initForOpeningContentTypes:asCopy:));
+    Dl_info mine;
+    if (!m || !dladdr((const void *)method_getImplementation(m), &mine) || !mine.dli_fname) return NO;
+    BOOL hooked = strncmp(mine.dli_fname, "/System/", 8) && strncmp(mine.dli_fname, "/usr/lib/", 9);
+    if (hooked) fprintf(stderr, "launcher: the document picker is rewritten by %s (an injected tweak): the Cloud saves folder picker is not offered, Export save / Import save are\n", mine.dli_fname ?: "?");
+    return hooked;
+}
+static NSString *save_dir(void) {   // DM_SAVE (main.m: Documents/save)
+    const char *e = getenv("DM_SAVE");
+    if (e && *e) return [NSFileManager.defaultManager stringWithFileSystemRepresentation:e length:strlen(e)];
+    return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"save"];
+}
+static NSString *saved_when(int64_t t) {
+    return [NSDateFormatter localizedStringFromDate:[NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)t] dateStyle:NSDateFormatterMediumStyle timeStyle:NSDateFormatterShortStyle];
+}
 @implementation DmSettingsVC
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -261,10 +289,12 @@ static int increased_memory_limit(void) {
 - (NSInteger)cloudSection { return self.resetSection + 1; }
 - (NSInteger)memorySection { return self.resetSection + 2; }
 - (NSString *)cloudFolder:(BOOL *)stale { BOOL st = NO; NSString *f = dm_cloud_saves_path(&st); if (stale) *stale = st; return f ?: @""; }
+// Cloud saves: the folder, Choose, Turn off (with a folder), then Export save and Import save, which need no folder (save_transfer.c)
+- (NSArray<NSString *> *)cloudRows { return [self cloudFolder:NULL].length ? @[@"status", @"choose", @"off", @"export", @"import"] : @[@"status", @"choose", @"export", @"import"]; }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return self.m.sections.count + 3; }   // the sections, Reset, Cloud saves, Memory available
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)sec {
     if (sec < (NSInteger)self.m.sections.count) return (NSInteger)[self.m inSection:self.m.sections[sec]].count;
-    if (sec == self.cloudSection) return [self cloudFolder:NULL].length ? 3 : 2;
+    if (sec == self.cloudSection) return (NSInteger)self.cloudRows.count;
     return sec == self.memorySection ? 2 : 1;
 }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)sec { return sec < (NSInteger)self.m.sections.count ? self.m.sections[sec] : nil; }
@@ -274,7 +304,7 @@ static int increased_memory_limit(void) {
         BOOL stale = NO; NSString *f = [self cloudFolder:&stale];
         if (self.cloudNote.length) return self.cloudNote;
         if (stale && !f.length) return @"The folder you chose before is no longer readable (the app was signed differently). Please choose it again.";
-        return @"Choose a folder in iCloud Drive, and the same one in the Mac app's Cloud saves. The save comes in when the game starts and goes out after each save; a save that is replaced is kept in save-backups.";
+        return @"Choose a folder in iCloud Drive, and the same one in the Mac app's Cloud saves. The save comes in when the game starts and goes out after each save; a save that is replaced is kept in save-backups.\n\nExport save copies the save out as one file (to iCloud Drive or anywhere in Files); Import save brings such a file back in, keeping this device's save in save-backups first. They work when no folder can be chosen.";
     }
     if (sec == self.memorySection && !increased_memory_limit())
         return @"Increased Memory Limit is off: iOS gives this app less memory, and a big game can be closed when an area loads. A free Apple ID cannot turn it on (the signing app drops it); a paid developer account can. Texture memory saver (Performance) helps meanwhile.";
@@ -296,7 +326,8 @@ static int increased_memory_limit(void) {
     }
     if (ip.section == self.cloudSection) {   // Cloud saves: the folder, Choose, Turn off (Launcher.swift CloudSavesSection)
         NSString *f = [self cloudFolder:NULL];
-        if (ip.row == 0) {
+        NSString *row = self.cloudRows[(NSUInteger)ip.row];
+        if ([row isEqualToString:@"status"]) {
             UILabel *l = body_label(@"Cloud saves"), *st = value_label(f.length ? f.lastPathComponent : @"Off");
             st.lineBreakMode = NSLineBreakByTruncatingMiddle; [st setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
             [v addSubview:l]; [v addSubview:st];
@@ -305,17 +336,23 @@ static int increased_memory_limit(void) {
                 [st.trailingAnchor constraintEqualToAnchor:g.trailingAnchor], [st.centerYAnchor constraintEqualToAnchor:v.centerYAnchor], [v.heightAnchor constraintGreaterThanOrEqualToConstant:48]]];
             return c;
         }
-        BOOL off = ip.row == 2;
+        BOOL off = [row isEqualToString:@"off"], isExport = [row isEqualToString:@"export"], isImport = [row isEqualToString:@"import"];
         UIButtonConfiguration *cfg = [UIButtonConfiguration plainButtonConfiguration]; cfg.contentInsets = NSDirectionalEdgeInsetsZero;
-        cfg.title = off ? @"Turn off cloud saves" : f.length ? @"Choose a different folder…" : @"Choose a folder in iCloud Drive…";
+        cfg.title = isExport ? @"Export save…" : isImport ? @"Import save…" : off ? @"Turn off cloud saves" : f.length ? @"Choose a different folder…" : @"Choose a folder in iCloud Drive…";
         if (off) cfg.baseForegroundColor = UIColor.systemRedColor;
         __weak DmSettingsVC *w = self;
         UIButton *b = [UIButton buttonWithConfiguration:cfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
             DmSettingsVC *me = w; if (!me) return;
             if (off) { dm_clear_cloud_saves(); me.cloudNote = nil; [me.tableView reloadData]; return; }
+            if (isExport) { [me exportSave]; return; }
+            if (isImport) { [me importSave]; return; }
+            if (folder_picker_hooked()) {
+                me.cloudNote = @"A file picker fix injected into this app turns every picker into a copy, and iOS cannot copy a folder, so choosing a folder would close the app. Use Export save and Import save below, or install the app without that tweak to choose a folder.";
+                [me.tableView reloadData]; return;
+            }
             // .open (not a copy): the folder stays where it is and the bookmark keeps pointing at it
             UIDocumentPickerViewController *pk = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeFolder] asCopy:NO];
-            pk.allowsMultipleSelection = NO; pk.delegate = me;
+            pk.allowsMultipleSelection = NO; pk.delegate = me; me.pickMode = PICK_FOLDER;
             [me presentViewController:pk animated:YES completion:nil];
         }]];
         b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading; b.translatesAutoresizingMaskIntoConstraints = NO; [v addSubview:b];
@@ -403,10 +440,83 @@ static int increased_memory_limit(void) {
     }
     return [UIMenu menuWithTitle:@"" image:nil identifier:nil options:UIMenuOptionsSingleSelection children:items];
 }
+// A folder picker that hands back nothing: iOS could not give this app the folder. Seen on apps a signing service re-signed (FlareStore: Cocoa 257 "Could not resolve
+// bookmark" in the console, the picker closing by itself or Open doing nothing; seedds/nxnative#1148); the same build signed in Xcode gets the folder
+static NSString *const kNoFolder = @"No folder came back. If the picker closed by itself or Open did nothing, iOS cannot give this app a folder under the way it was signed (some signing services install apps so). Export save and Import save below work without a folder; signing the app with your own Apple ID (Xcode, SideStore, AltStore) lets you choose one.";
 - (void)documentPicker:(UIDocumentPickerViewController *)c didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    if (!urls.firstObject) return;
-    self.cloudNote = dm_store_cloud_saves(urls.firstObject) ? @"Saved. The game uses this folder when you press Play." : @"That folder could not be remembered — try a different one.";
+    NSInteger mode = self.pickMode; self.pickMode = PICK_FOLDER;
+    if (mode == PICK_EXPORT) { [self exportDone:urls.count > 0]; return; }
+    if (mode == PICK_IMPORT) { if (urls.firstObject) [self importFrom:urls.firstObject]; return; }
+    if (!urls.firstObject) { fprintf(stderr, "[RED] launcher: the folder picker handed back no folder\n"); self.cloudNote = kNoFolder; [self.tableView reloadData]; return; }
+    self.cloudNote = dm_store_cloud_saves(urls.firstObject) ? @"Saved. The game uses this folder when you press Play." : @"That folder could not be remembered — try a different one, or use Export save and Import save below.";
     [self.tableView reloadData];
+}
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)c {
+    NSInteger mode = self.pickMode; self.pickMode = PICK_FOLDER;
+    if (mode == PICK_EXPORT) { [self exportDone:NO]; return; }
+    if (mode == PICK_FOLDER) { fprintf(stderr, "launcher: the folder picker closed without a folder\n"); self.cloudNote = kNoFolder; [self.tableView reloadData]; }
+}
+
+// ---- Export save / Import save (save_transfer.c): one file through a copying picker, which works under any signature ----
+- (void)say:(NSString *)note { self.cloudNote = note; [self.tableView reloadData]; }
+- (void)exportSave {
+    NSString *name = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: @DM_GAME_ID;
+    NSDateFormatter *df = [NSDateFormatter new]; df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"]; df.dateFormat = @"yyyy-MM-dd HH.mm";
+    NSString *file = [NSString stringWithFormat:@"%@ save %@.dmsync", [[name componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/:\\"]] componentsJoinedByString:@" "], [df stringFromDate:NSDate.date]];
+    NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"save-export"];
+    [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *out = [dir stringByAppendingPathComponent:file];
+    ss_meta m;
+    int n = nxw_save_export(save_dir().fileSystemRepresentation, DM_GAME_ID, out.fileSystemRepresentation, &m);
+    if (n == 0) { [self say:@"There is no save to export yet: play until the game has saved."]; return; }
+    if (n < 0) { [self say:@"The save could not be packed into a file (log.txt says why)."]; return; }
+    self.exported = [NSURL fileURLWithPath:out];
+    UIDocumentPickerViewController *pk = [[UIDocumentPickerViewController alloc] initForExportingURLs:@[self.exported] asCopy:YES];
+    pk.delegate = self; self.pickMode = PICK_EXPORT;
+    [self presentViewController:pk animated:YES completion:nil];
+}
+- (void)exportDone:(BOOL)ok {
+    if (self.exported) [NSFileManager.defaultManager removeItemAtURL:self.exported.URLByDeletingLastPathComponent error:nil];
+    if (ok) fprintf(stderr, "launcher: save exported as %s\n", self.exported.lastPathComponent.UTF8String ?: "?");
+    self.exported = nil;
+    [self say:ok ? @"Exported. Import save on another device (or after reinstalling) brings it back." : @"Not exported."];
+}
+- (void)importSave {
+    // A copy (not .open): the picker gives this app its own copy of the file, which needs no folder access
+    UIDocumentPickerViewController *pk = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData] asCopy:YES];
+    pk.allowsMultipleSelection = NO; pk.delegate = self; self.pickMode = PICK_IMPORT;
+    [self presentViewController:pk animated:YES completion:nil];
+}
+- (void)importFrom:(NSURL *)url {
+    BOOL scoped = [url startAccessingSecurityScopedResource];
+    // Read where the picker left it, into a file of this app's own, before asking: the picker's copy may go once this returns
+    NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"save-import"];
+    NSString *local = [dir stringByAppendingPathComponent:@"in.dmsync"];
+    [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSError *err = nil; BOOL copied = [NSFileManager.defaultManager copyItemAtURL:url toURL:[NSURL fileURLWithPath:local] error:&err];
+    if (scoped) [url stopAccessingSecurityScopedResource];
+    if (!copied) { fprintf(stderr, "[RED] launcher: the picked save %s cannot be read: %s\n", url.path.UTF8String ?: "?", err.localizedDescription.UTF8String ?: "?"); [self say:@"That file could not be read."]; return; }
+    ss_meta m;
+    int r = nxw_save_check(local.fileSystemRepresentation, DM_GAME_ID, &m);
+    if (r) {
+        [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
+        [self say:r == NXW_SAVE_OTHER_GAME ? [NSString stringWithFormat:@"That file is the save of another game (%s), not this one's.", m.title]
+                : r == NXW_SAVE_EMPTY ? @"That file holds no save." : @"That is not an exported save, or the file is damaged or incomplete."];
+        return;
+    }
+    NSString *what = [NSString stringWithFormat:@"The save in %@ (%d files, saved %@ on %s) replaces this device's save. This device's save is kept in save-backups first.", url.lastPathComponent, m.files, saved_when(m.saved), m.device];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Import this save?" message:what preferredStyle:UIAlertControllerStyleAlert];
+    __weak DmSettingsVC *w = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *x) { [NSFileManager.defaultManager removeItemAtPath:dir error:nil]; [w say:@"Not imported."]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+        ss_meta got; char kept[PATH_MAX];
+        int k = nxw_save_import(save_dir().fileSystemRepresentation, DM_GAME_ID, local.fileSystemRepresentation, &got, kept, sizeof kept);
+        [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
+        [w say:!k ? (kept[0] ? @"Imported. This device's earlier save is kept in save-backups." : @"Imported.") : @"The save could not be imported (log.txt says why)."];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 - (void)refreshReset { [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:0 inSection:self.resetSection]] withRowAnimation:UITableViewRowAnimationNone]; }
 
