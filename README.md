@@ -6,7 +6,7 @@ This repository is a fork of [seedds/nxnative](https://github.com/seedds/nxnativ
 
 > Panduan langkah demi langkah dalam Bahasa Indonesia: [win/TUTORIAL.md](win/TUTORIAL.md).
 > On Linux the same build runs with native tools and Apple's Metal compiler under Wine: [win/LINUX.md](win/LINUX.md).
-> Upstream's own README (games gallery, Mac packing, playing) is kept as [README.nxnative.md](README.nxnative.md).
+> Upstream's own README (games, Mac packing, playing) is kept as [README.nxnative.md](README.nxnative.md).
 
 <p align="center">
   <img src="docs/images/windows/gui-start.png" width="32%" alt="The builder window, before picking files">
